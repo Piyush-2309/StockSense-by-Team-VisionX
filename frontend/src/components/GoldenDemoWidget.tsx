@@ -1,7 +1,8 @@
-import React, { useState } from 'react';
-import { X, Sparkles, CheckCircle2, ArrowRight, Play, RotateCcw, ShieldCheck, ScrollText } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { X, Sparkles, CheckCircle2, Play, ScrollText, Loader2 } from 'lucide-react';
 import confetti from 'canvas-confetti';
-import { inventoryEngine } from '../services/inventoryEngine';
+import { productService, locationService, receiptService, transferService, deliveryService, adjustmentService, stockService } from '../services/api';
+import { ProductResponse, LocationResponse, StockResponse } from '../types';
 import { useToast } from './Toast';
 import { RouteId } from './Sidebar';
 
@@ -15,106 +16,176 @@ export const GoldenDemoWidget: React.FC<GoldenDemoWidgetProps> = ({ isOpen, onCl
   const { showToast } = useToast();
   const [currentStep, setCurrentStep] = useState<number>(1);
   const [isRunning, setIsRunning] = useState(false);
+  const [products, setProducts] = useState<ProductResponse[]>([]);
+  const [locations, setLocations] = useState<LocationResponse[]>([]);
+  const [stocks, setStocks] = useState<StockResponse[]>([]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const loadState = async () => {
+      try {
+        const [prodRes, locRes, stockRes] = await Promise.all([
+          productService.list({ size: 100 }),
+          locationService.list(),
+          stockService.list().catch(() => [] as StockResponse[]),
+        ]);
+        setProducts(prodRes.content || []);
+        setLocations(locRes || []);
+        setStocks(stockRes || []);
+      } catch (err) {
+        console.error('Failed to load demo context:', err);
+      }
+    };
+    loadState();
+  }, [isOpen]);
 
   if (!isOpen) return null;
+
+  const targetProduct = products.find((p) => p.sku === 'STL-001') || products[0];
+  const sourceLocation = locations[0];
+  const destLocation = locations.length > 1 ? locations[1] : locations[0];
+
+  const currentQuant = stocks.find((s) => s.productId === targetProduct?.id);
 
   const steps = [
     {
       num: 1,
-      title: 'Inbound Receipt (+100 kg)',
-      desc: 'Receive 100 kg Steel Rod from ABC Metals into Main Warehouse / Rack A.',
-      expected: 'Steel Rod stock jumps from 0 kg to 100 kg.',
-      badge: '+100 kg Receipt',
+      title: 'Inbound Receipt (+100 units)',
+      desc: `Receive 100 units of ${targetProduct?.name || 'materials'} into ${sourceLocation?.name || 'Warehouse'}.`,
+      expected: 'Physical stock balance increases by 100 units.',
+      badge: '+100 Receipt',
       badgeColor: '#10B981',
     },
     {
       num: 2,
-      title: 'Internal Transfer (30 kg)',
-      desc: 'Transfer 30 kg Steel Rod from Main Warehouse / Rack A to Production / Rack P1.',
-      expected: 'Rack A = 70 kg, Production = 30 kg. Total stock = 100 kg (Unchanged).',
+      title: 'Internal Transfer (30 units)',
+      desc: `Relocate 30 units from ${sourceLocation?.name || 'Rack 1'} to ${destLocation?.name || 'Rack 2'}.`,
+      expected: 'Stock transferred between locations with zero deficit.',
       badge: 'Relocation',
       badgeColor: '#6D28D9',
     },
     {
       num: 3,
-      title: 'Customer Delivery (-20 kg)',
-      desc: 'Dispatch 20 kg Steel Rod to Apex Manufacturing with stock verification.',
-      expected: 'Rack A drops from 70 kg to 50 kg. Total stock = 80 kg.',
-      badge: '-20 kg Outgoing',
+      title: 'Customer Delivery (-20 units)',
+      desc: `Dispatch 20 units to customer client account with automated reservation check.`,
+      expected: 'Deducted from warehouse stock. Delivered status marked.',
+      badge: '-20 Outgoing',
       badgeColor: '#3B82F6',
     },
     {
       num: 4,
-      title: 'Physical Count & Adjustment (-3 kg)',
-      desc: 'Floor count reveals 77 kg total (Damaged stock). Reconcile with -3 kg adjustment.',
-      expected: 'System stock adjusted to exactly 77 kg.',
-      badge: '-3 kg Variance',
+      title: 'Physical Count & Adjustment (-3 units)',
+      desc: 'Floor audit records variance. Reconcile with verified audit adjustment.',
+      expected: 'System stock reconciled to actual physical count.',
+      badge: '-3 Variance',
       badgeColor: '#EF4444',
     },
     {
       num: 5,
       title: 'Ledger Audit & Dashboard Verification',
-      desc: 'Inspect the complete double-entry ledger with all 4 signed movements and live KPI reflect.',
-      expected: 'Dashboard KPIs and Risk Center instantly update in real-time.',
+      desc: 'Inspect the complete double-entry ledger with all transactions and live KPIs.',
+      expected: 'Immutable audit trail recorded in PostgreSQL database.',
       badge: 'Immutable Audit',
       badgeColor: '#0F172A',
     },
   ];
 
-  const handleRunStep = (stepNum: 1 | 2 | 3 | 4 | 5) => {
-    setIsRunning(true);
-    const res = inventoryEngine.runGoldenDemoStep(stepNum);
-    setIsRunning(false);
+  const executeStep1 = async () => {
+    if (!targetProduct || !sourceLocation) throw new Error('Product/location not found');
+    const rec = await receiptService.create({
+      supplier: 'Apex Materials Corp',
+      destinationLocationId: sourceLocation.id,
+      items: [{ productId: targetProduct.id, quantity: 100 }],
+      notes: 'Golden Demo Step 1: Inbound Receipt (+100)',
+    });
+    await receiptService.validate(rec.documentId);
+  };
 
-    if (res.success) {
+  const executeStep2 = async () => {
+    if (!targetProduct || !sourceLocation || !destLocation) throw new Error('Locations not found');
+    const tr = await transferService.create({
+      sourceLocationId: sourceLocation.id,
+      destinationLocationId: destLocation.id,
+      items: [{ productId: targetProduct.id, quantity: 30 }],
+      notes: 'Golden Demo Step 2: Internal Transfer (30)',
+    });
+    await transferService.validate(tr.documentId);
+  };
+
+  const executeStep3 = async () => {
+    if (!targetProduct || !sourceLocation) throw new Error('Product/location not found');
+    const del = await deliveryService.create({
+      customer: 'Zenith Logistics Ltd',
+      sourceLocationId: sourceLocation.id,
+      items: [{ productId: targetProduct.id, quantity: 20 }],
+      notes: 'Golden Demo Step 3: Customer Dispatch (-20)',
+    });
+    await deliveryService.validate(del.documentId);
+  };
+
+  const executeStep4 = async () => {
+    if (!targetProduct || !sourceLocation) throw new Error('Product/location not found');
+    const adj = await adjustmentService.create({
+      locationId: sourceLocation.id,
+      reason: 'Physical Count Audit',
+      notes: 'Golden Demo Step 4: Audit count reconciliation',
+      items: [{ productId: targetProduct.id, physicalQuantity: 47 }],
+    });
+    await adjustmentService.validate(adj.documentId);
+  };
+
+  const handleRunStep = async (stepNum: number) => {
+    setIsRunning(true);
+    try {
+      if (stepNum === 1) await executeStep1();
+      else if (stepNum === 2) await executeStep2();
+      else if (stepNum === 3) await executeStep3();
+      else if (stepNum === 4) await executeStep4();
+
       confetti({
-        particleCount: stepNum === 4 || stepNum === 5 ? 80 : 40,
+        particleCount: stepNum >= 4 ? 80 : 40,
         spread: 60,
         origin: { y: 0.6 },
       });
-      showToast('success', `Step ${stepNum} Completed!`, res.message);
+      showToast('success', `Step ${stepNum} Completed!`, `Operation executed and confirmed on backend database.`);
       if (stepNum < 5) {
-        setCurrentStep((stepNum + 1) as any);
+        setCurrentStep(stepNum + 1);
       }
-    } else {
-      showToast('error', 'Execution Error', res.message);
+    } catch (err: any) {
+      showToast('error', 'Execution Error', err?.message || 'Could not complete step');
+    } finally {
+      setIsRunning(false);
     }
   };
 
   const handleRunFullDemo = async () => {
     setIsRunning(true);
-    // Step 1
-    inventoryEngine.runGoldenDemoStep(1);
-    await new Promise((r) => setTimeout(r, 600));
-    // Step 2
-    inventoryEngine.runGoldenDemoStep(2);
-    await new Promise((r) => setTimeout(r, 600));
-    // Step 3
-    inventoryEngine.runGoldenDemoStep(3);
-    await new Promise((r) => setTimeout(r, 600));
-    // Step 4
-    inventoryEngine.runGoldenDemoStep(4);
-    await new Promise((r) => setTimeout(r, 600));
+    try {
+      await executeStep1();
+      await new Promise((r) => setTimeout(r, 400));
+      await executeStep2();
+      await new Promise((r) => setTimeout(r, 400));
+      await executeStep3();
+      await new Promise((r) => setTimeout(r, 400));
+      await executeStep4();
 
-    setIsRunning(false);
-    setCurrentStep(5);
-
-    confetti({
-      particleCount: 120,
-      spread: 80,
-      origin: { y: 0.5 },
-    });
-
-    showToast(
-      'success',
-      'Golden Demo Completed!',
-      'All 4 operations executed. Steel Rod balance: 77 kg. Inspect the Stock Ledger!'
-    );
+      confetti({
+        particleCount: 120,
+        spread: 80,
+        origin: { y: 0.5 },
+      });
+      setCurrentStep(5);
+      showToast(
+        'success',
+        'Golden Demo Completed!',
+        'All 4 operations executed and committed to PostgreSQL database. Inspect the Stock Ledger!'
+      );
+    } catch (err: any) {
+      showToast('error', 'Demo Failed', err?.message || 'Error executing golden demo pipeline');
+    } finally {
+      setIsRunning(false);
+    }
   };
-
-  const steelRod = inventoryEngine.getProductById('prod-steel-rod');
-  const rackAQuant = inventoryEngine.getQuants('prod-steel-rod', 'wh-main', 'loc-rack-a')[0]?.quantity || 0;
-  const prodP1Quant = inventoryEngine.getQuants('prod-steel-rod', 'wh-prod', 'loc-prod-p1')[0]?.quantity || 0;
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -163,7 +234,7 @@ export const GoldenDemoWidget: React.FC<GoldenDemoWidgetProps> = ({ isOpen, onCl
           </button>
         </div>
 
-        {/* Live Steel Rod Balance Status Box */}
+        {/* Live Status Box */}
         <div
           style={{
             background: '#F5F3FF',
@@ -175,13 +246,14 @@ export const GoldenDemoWidget: React.FC<GoldenDemoWidgetProps> = ({ isOpen, onCl
           }}
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span style={{ fontSize: 12.5, fontWeight: 700, color: '#5B21B6' }}>LIVE STATE: Steel Rod (STL-001)</span>
-            <span className="badge badge-purple">{steelRod?.totalStock ?? 0} kg Total</span>
+            <span style={{ fontSize: 12.5, fontWeight: 700, color: '#5B21B6' }}>
+              TARGET ITEM: {targetProduct?.name || 'Material Item'} ({targetProduct?.sku || 'SKU'})
+            </span>
+            <span className="badge badge-purple">{targetProduct?.totalStock ?? 0} {targetProduct?.unitOfMeasure || 'units'}</span>
           </div>
           <div style={{ display: 'flex', gap: 16, fontSize: 12, color: '#4C1D95' }}>
-            <span>Rack A: <strong>{rackAQuant} kg</strong></span>
-            <span>Production P1: <strong>{prodP1Quant} kg</strong></span>
-            <span>Status: <strong>{steelRod?.status}</strong></span>
+            <span>Warehouse: <strong>{sourceLocation?.warehouseName || 'Main'}</strong></span>
+            <span>Status: <strong>{targetProduct?.stockStatus || 'Active'}</strong></span>
           </div>
         </div>
 
@@ -247,12 +319,16 @@ export const GoldenDemoWidget: React.FC<GoldenDemoWidgetProps> = ({ isOpen, onCl
 
                 {s.num < 5 ? (
                   <button
-                    onClick={() => handleRunStep(s.num as any)}
+                    onClick={() => handleRunStep(s.num)}
                     disabled={isRunning}
                     className="btn btn-sm btn-primary"
                     style={{ flexShrink: 0 }}
                   >
-                    <Play size={13} />
+                    {isRunning && currentStep === s.num ? (
+                      <Loader2 size={13} className="animate-spin" />
+                    ) : (
+                      <Play size={13} />
+                    )}
                     Run Step {s.num}
                   </button>
                 ) : (
@@ -285,16 +361,11 @@ export const GoldenDemoWidget: React.FC<GoldenDemoWidgetProps> = ({ isOpen, onCl
           }}
         >
           <button
-            onClick={() => {
-              inventoryEngine.resetToDefault();
-              setCurrentStep(1);
-              showToast('info', 'Database Reset', 'State restored to pristine initial conditions.');
-            }}
+            onClick={() => setCurrentStep(1)}
             className="btn btn-outline"
             style={{ fontSize: 12.5 }}
           >
-            <RotateCcw size={14} />
-            Reset State
+            Reset Step View
           </button>
 
           <div style={{ display: 'flex', gap: 10 }}>
@@ -313,7 +384,7 @@ export const GoldenDemoWidget: React.FC<GoldenDemoWidgetProps> = ({ isOpen, onCl
               className="btn btn-primary"
               style={{ background: 'linear-gradient(135deg, #7C3AED 0%, #4C1D95 100%)' }}
             >
-              <Sparkles size={15} />
+              {isRunning ? <Loader2 size={15} className="animate-spin" /> : <Sparkles size={15} />}
               Run 1-Click Golden Demo
             </button>
           </div>

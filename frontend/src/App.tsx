@@ -1,8 +1,8 @@
-import React, { useState, useEffect } from 'react';
-import { inventoryEngine } from './services/inventoryEngine';
-import { RouteId, Sidebar } from './components/Sidebar';
-import { Topbar } from './components/Topbar';
+import React, { useState, useCallback } from 'react';
+import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { ToastProvider, useToast } from './components/Toast';
+import { Sidebar } from './components/Sidebar';
+import { Topbar } from './components/Topbar';
 import { GlobalSearchModal } from './components/GlobalSearchModal';
 import { NotificationDrawer } from './components/NotificationDrawer';
 import { StockSenseAiDrawer } from './components/StockSenseAiDrawer';
@@ -29,15 +29,65 @@ import { ReorderingRulesView } from './views/ReorderingRulesView';
 import { ProfileView } from './views/ProfileView';
 import { AuthView } from './views/AuthView';
 import { Sparkles, Bot } from 'lucide-react';
+import { dashboardService, warehouseService } from './services/api';
 
+import type { RouteId } from './components/Sidebar';
+import type { WarehouseResponse, UserRole } from './types';
+
+// ========================
+// Loading spinner shown while restoring session
+// ========================
+const AuthLoadingScreen: React.FC = () => (
+  <div
+    style={{
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      height: '100vh',
+      width: '100vw',
+      background: '#F8F9FC',
+      flexDirection: 'column',
+      gap: 16,
+    }}
+  >
+    <div
+      style={{
+        width: 44,
+        height: 44,
+        borderRadius: 12,
+        background: 'linear-gradient(135deg, #7C3AED 0%, #4C1D95 100%)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        boxShadow: '0 4px 14px rgba(109, 40, 217, 0.4)',
+        animation: 'pulse 1.5s infinite',
+      }}
+    >
+      <svg viewBox="0 0 24 24" width="24" height="24" fill="none">
+        <polygon points="12,3 20,7.5 12,12 4,7.5" fill="#DDD6FE" />
+        <polygon points="4,7.5 12,12 12,21 4,16.5" fill="#A78BFA" />
+        <polygon points="12,12 20,7.5 20,16.5 12,21" fill="#8B5CF6" />
+      </svg>
+    </div>
+    <span style={{ color: '#6D28D9', fontWeight: 600, fontSize: 14 }}>Loading StockSense…</span>
+  </div>
+);
+
+// ========================
+// Main Application (authenticated)
+// ========================
 const MainApplication: React.FC = () => {
   const { showToast } = useToast();
-  const [, setTick] = useState(0);
+  const { user, logout } = useAuth();
 
   // Router & Entity State
   const [currentRoute, setCurrentRoute] = useState<RouteId>('dashboard');
   const [targetEntityId, setTargetEntityId] = useState<string | undefined>(undefined);
   const [selectedWarehouse, setSelectedWarehouse] = useState<string>('all');
+
+  // Global refresh counter — incremented after mutations to trigger re-fetches
+  const [refreshKey, setRefreshKey] = useState(0);
+  const triggerRefresh = useCallback(() => setRefreshKey((k) => k + 1), []);
 
   // Modals & Drawers
   const [isSearchOpen, setIsSearchOpen] = useState(false);
@@ -51,72 +101,101 @@ const MainApplication: React.FC = () => {
   const [openNewTransferModal, setOpenNewTransferModal] = useState(false);
   const [selectedProductForAction, setSelectedProductForAction] = useState<string | undefined>(undefined);
 
-  // Subscribe to real-time inventory engine state
-  useEffect(() => {
-    const unsubscribe = inventoryEngine.subscribe(() => {
-      setTick((t) => t + 1);
-    });
-    return unsubscribe;
-  }, []);
-
   const handleNavigate = (route: RouteId, targetId?: string) => {
     setCurrentRoute(route);
     setTargetEntityId(targetId);
+    // Reset modal flags so they don't re-trigger on navigation
+    setOpenNewReceiptModal(false);
+    setOpenNewDeliveryModal(false);
+    setOpenNewTransferModal(false);
+    setSelectedProductForAction(undefined);
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
-  const handleResetData = () => {
-    inventoryEngine.resetToDefault();
-    showToast('info', 'Database Reset', 'State reset to initial demo parameters.');
+  const [warehouses, setWarehouses] = useState<WarehouseResponse[]>([]);
+  const [dashboardStats, setDashboardStats] = useState({
+    pendingReceipts: 0,
+    pendingTransfers: 0,
+    pendingDeliveries: 0,
+    risksCount: 0,
+  });
+
+  React.useEffect(() => {
+    const fetchWarehouses = async () => {
+      try {
+        const data = await warehouseService.list();
+        setWarehouses(data);
+      } catch (err) {
+        console.error('Failed to fetch warehouses', err);
+      }
+    };
+    fetchWarehouses();
+  }, []);
+
+  React.useEffect(() => {
+    const fetchDashboard = async () => {
+      try {
+        const data = await dashboardService.getDashboard();
+        setDashboardStats({
+          pendingReceipts: data.pendingReceipts || 0,
+          pendingTransfers: data.pendingTransfers || 0,
+          pendingDeliveries: data.pendingDeliveries || 0,
+          risksCount: (data.lowStockCount || 0) + (data.outOfStockCount || 0),
+        });
+      } catch (err) {
+        console.error('Failed to fetch dashboard stats', err);
+      }
+    };
+    fetchDashboard();
+  }, [refreshKey]);
+
+  const handleLogout = () => {
+    logout();
+    showToast('info', 'Signed Out', 'You have been signed out successfully.');
   };
 
-  // Live Metrics
-  const stats = inventoryEngine.getDashboardStats(selectedWarehouse);
-  const user = inventoryEngine.getUser();
-  const warehouses = inventoryEngine.getWarehouses();
-  const notifications = inventoryEngine.getNotifications();
-  const unreadNotifications = notifications.filter((n) => !n.isRead).length;
-
-  if (currentRoute === 'login') {
-    return <AuthView onLoginSuccess={() => setCurrentRoute('dashboard')} />;
-  }
+  // Build user object for topbar
+  const topbarUser = user
+    ? user
+    : { id: 0, name: '', email: '', role: 'MANAGER' as UserRole };
 
   return (
     <div className="app-container">
-      {/* 1. Dark Purple Enterprise Sidebar */}
+      {/* Sidebar */}
       <Sidebar
         currentRoute={currentRoute}
         onNavigate={handleNavigate}
-        pendingReceipts={stats.pendingReceiptsCount}
-        pendingTransfers={stats.pendingTransfersCount}
-        pendingDeliveries={stats.pendingDeliveriesCount}
-        risksCount={stats.lowStockCount + stats.outOfStockCount}
+        pendingReceipts={dashboardStats.pendingReceipts}
+        pendingTransfers={dashboardStats.pendingTransfers}
+        pendingDeliveries={dashboardStats.pendingDeliveries}
+        risksCount={dashboardStats.risksCount}
       />
 
-      {/* 2. Main Content Wrapper */}
+      {/* Main Content Wrapper */}
       <div className="main-wrapper">
         {/* Topbar */}
         <Topbar
           warehouses={warehouses}
           selectedWarehouse={selectedWarehouse}
           onSelectWarehouse={setSelectedWarehouse}
-          user={user}
-          unreadNotificationsCount={unreadNotifications}
+          user={topbarUser}
+          unreadNotificationsCount={0}
           onOpenNotifications={() => setIsNotificationsOpen(true)}
           onOpenSearch={() => setIsSearchOpen(true)}
           onOpenAi={() => setIsAiOpen(true)}
           onOpenGoldenDemo={() => setIsGoldenDemoOpen(true)}
-          onResetData={handleResetData}
+          onResetData={() => {}}
           onNavigate={handleNavigate}
+          onLogout={handleLogout}
         />
 
         {/* Dynamic Route View */}
         <main className="page-content">
           {currentRoute === 'dashboard' && (
             <DashboardView
-              stats={stats}
               selectedWarehouse={selectedWarehouse}
               onNavigate={handleNavigate}
+              refreshKey={refreshKey}
               onOpenNewReceipt={() => {
                 setOpenNewReceiptModal(true);
                 setCurrentRoute('receipts');
@@ -136,6 +215,7 @@ const MainApplication: React.FC = () => {
           {currentRoute === 'products' && !targetEntityId && (
             <ProductsView
               onNavigate={handleNavigate}
+              refreshKey={refreshKey}
               onOpenTransferForProduct={(prodId) => {
                 setSelectedProductForAction(prodId);
                 setOpenNewTransferModal(true);
@@ -152,6 +232,7 @@ const MainApplication: React.FC = () => {
             <ProductDetailView
               productId={targetEntityId}
               onNavigate={handleNavigate}
+              refreshKey={refreshKey}
               onOpenReceiptForProduct={(prodId) => {
                 setSelectedProductForAction(prodId);
                 setOpenNewReceiptModal(true);
@@ -173,6 +254,8 @@ const MainApplication: React.FC = () => {
             <ReceiptsView
               onNavigate={handleNavigate}
               openNewModalOnLoad={openNewReceiptModal}
+              refreshKey={refreshKey}
+              onMutationSuccess={triggerRefresh}
             />
           )}
 
@@ -180,6 +263,8 @@ const MainApplication: React.FC = () => {
             <DeliveriesView
               onNavigate={handleNavigate}
               openNewModalOnLoad={openNewDeliveryModal}
+              refreshKey={refreshKey}
+              onMutationSuccess={triggerRefresh}
             />
           )}
 
@@ -188,6 +273,8 @@ const MainApplication: React.FC = () => {
               onNavigate={handleNavigate}
               openNewModalOnLoad={openNewTransferModal}
               preselectedProductId={selectedProductForAction}
+              refreshKey={refreshKey}
+              onMutationSuccess={triggerRefresh}
             />
           )}
 
@@ -195,13 +282,16 @@ const MainApplication: React.FC = () => {
             <AdjustmentsView
               onNavigate={handleNavigate}
               preselectedProductId={selectedProductForAction}
+              refreshKey={refreshKey}
+              onMutationSuccess={triggerRefresh}
             />
           )}
 
-          {currentRoute === 'stock' && <StockOverviewView onNavigate={handleNavigate} />}
+          {currentRoute === 'stock' && <StockOverviewView onNavigate={handleNavigate} refreshKey={refreshKey} />}
           {currentRoute === 'stock-location' && (
             <StockByLocationView
               onNavigate={handleNavigate}
+              refreshKey={refreshKey}
               onOpenTransferForProduct={(prodId) => {
                 setSelectedProductForAction(prodId);
                 setOpenNewTransferModal(true);
@@ -213,11 +303,12 @@ const MainApplication: React.FC = () => {
               }}
             />
           )}
-          {currentRoute === 'ledger' && <StockLedgerView onNavigate={handleNavigate} />}
+          {currentRoute === 'ledger' && <StockLedgerView onNavigate={handleNavigate} refreshKey={refreshKey} />}
           {currentRoute === 'cycle-counts' && <CycleCountsView onNavigate={handleNavigate} />}
           {currentRoute === 'risk' && (
             <RiskCenterView
               onNavigate={handleNavigate}
+              refreshKey={refreshKey}
               onOpenReceiptForProduct={(prodId) => {
                 setSelectedProductForAction(prodId);
                 setOpenNewReceiptModal(true);
@@ -228,6 +319,7 @@ const MainApplication: React.FC = () => {
           {currentRoute === 'reorder' && (
             <ReorderView
               onNavigate={handleNavigate}
+              refreshKey={refreshKey}
               onOpenReceiptForProduct={(prodId) => {
                 setSelectedProductForAction(prodId);
                 setOpenNewReceiptModal(true);
@@ -235,9 +327,9 @@ const MainApplication: React.FC = () => {
               }}
             />
           )}
-          {currentRoute === 'warehouses' && <WarehousesView onNavigate={handleNavigate} />}
-          {currentRoute === 'locations' && <LocationsView onNavigate={handleNavigate} />}
-          {currentRoute === 'categories' && <CategoriesView />}
+          {currentRoute === 'warehouses' && <WarehousesView onNavigate={handleNavigate} refreshKey={refreshKey} />}
+          {currentRoute === 'locations' && <LocationsView onNavigate={handleNavigate} refreshKey={refreshKey} />}
+          {currentRoute === 'categories' && <CategoriesView refreshKey={refreshKey} />}
           {currentRoute === 'reordering-rules' && <ReorderingRulesView />}
           {currentRoute === 'profile' && <ProfileView onNavigate={handleNavigate} />}
         </main>
@@ -309,9 +401,9 @@ const MainApplication: React.FC = () => {
       <NotificationDrawer
         isOpen={isNotificationsOpen}
         onClose={() => setIsNotificationsOpen(false)}
-        notifications={notifications}
-        onMarkRead={(id) => inventoryEngine.markNotificationAsRead(id)}
-        onMarkAllRead={() => inventoryEngine.markAllNotificationsAsRead()}
+        notifications={[]}
+        onMarkRead={() => {}}
+        onMarkAllRead={() => {}}
         onNavigate={handleNavigate}
       />
 
@@ -330,11 +422,24 @@ const MainApplication: React.FC = () => {
   );
 };
 
+// ========================
+// Root — auth gate
+// ========================
+const AppRouter: React.FC = () => {
+  const { isAuthenticated, isLoading } = useAuth();
+
+  if (isLoading) return <AuthLoadingScreen />;
+  if (!isAuthenticated) return <AuthView />;
+  return <MainApplication />;
+};
+
 export function App() {
   return (
-    <ToastProvider>
-      <MainApplication />
-    </ToastProvider>
+    <AuthProvider>
+      <ToastProvider>
+        <AppRouter />
+      </ToastProvider>
+    </AuthProvider>
   );
 }
 

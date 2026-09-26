@@ -1,52 +1,82 @@
-import React, { useState } from 'react';
-import { Building2, Plus, MapPin, CheckCircle2, X } from 'lucide-react';
-import { inventoryEngine } from '../services/inventoryEngine';
+import React, { useState, useEffect } from 'react';
+import { Building2, Plus, MapPin, X, Loader2 } from 'lucide-react';
+import { warehouseService, locationService, stockService } from '../services/api';
+import { WarehouseResponse, LocationResponse, StockResponse } from '../types';
 import { useToast } from '../components/Toast';
 import { RouteId } from '../components/Sidebar';
 
 interface WarehousesViewProps {
   onNavigate: (route: RouteId) => void;
+  refreshKey?: number;
 }
 
-export const WarehousesView: React.FC<WarehousesViewProps> = ({ onNavigate }) => {
+export const WarehousesView: React.FC<WarehousesViewProps> = ({ onNavigate, refreshKey = 0 }) => {
   const { showToast } = useToast();
-  const warehouses = inventoryEngine.getWarehouses();
-  const locations = inventoryEngine.getLocations();
+  const [warehouses, setWarehouses] = useState<WarehouseResponse[]>([]);
+  const [locations, setLocations] = useState<LocationResponse[]>([]);
+  const [stocks, setStocks] = useState<StockResponse[]>([]);
+  const [loading, setLoading] = useState(true);
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
   const [formData, setFormData] = useState({ name: '', code: '', address: '' });
 
-  const handleAddWarehouse = (e: React.FormEvent) => {
+  const fetchData = async () => {
+    setLoading(true);
+    try {
+      const [whRes, locRes, stockRes] = await Promise.all([
+        warehouseService.list(),
+        locationService.list(),
+        stockService.list().catch(() => [] as StockResponse[]),
+      ]);
+      setWarehouses(whRes || []);
+      setLocations(locRes || []);
+      setStocks(stockRes || []);
+    } catch (err) {
+      console.error('Failed to load warehouses:', err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchData();
+  }, [refreshKey]);
+
+  const handleAddWarehouse = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!formData.name.trim() || !formData.code.trim()) {
       showToast('error', 'Validation Error', 'Name and Code are required.');
       return;
     }
 
-    const state = inventoryEngine.getState();
-    const newWh = {
-      id: `wh-${Date.now()}`,
-      code: formData.code.toUpperCase(),
-      name: formData.name,
-      address: formData.address || 'Standard logistics facility',
-      locationCount: 1,
-      status: 'Active' as const,
-    };
-    state.warehouses.push(newWh);
-    // Add default rack
-    state.locations.push({
-      id: `loc-${Date.now()}`,
-      warehouseId: newWh.id,
-      warehouseName: newWh.name,
-      code: 'RACK-1',
-      name: 'Default Rack 1',
-      type: 'Internal',
-      status: 'Active',
-    });
+    setSubmitting(true);
+    try {
+      const created = await warehouseService.create({
+        name: formData.name.trim(),
+        code: formData.code.trim().toUpperCase(),
+        address: formData.address.trim() || undefined,
+      });
 
-    inventoryEngine.resetToDefault(); // trigger re-render
-    showToast('success', 'Warehouse Added', `Warehouse ${newWh.name} (${newWh.code}) created successfully.`);
-    setIsModalOpen(false);
-    setFormData({ name: '', code: '', address: '' });
+      // Also create a default storage location for this warehouse
+      try {
+        await locationService.create({
+          warehouseId: created.id,
+          name: `${created.name} Rack 1`,
+          code: 'RACK-01',
+        });
+      } catch (locErr) {
+        console.warn('Initial rack note:', locErr);
+      }
+
+      showToast('success', 'Warehouse Added', `Warehouse ${created.name} (${created.code}) created successfully.`);
+      setIsModalOpen(false);
+      setFormData({ name: '', code: '', address: '' });
+      fetchData();
+    } catch (err: any) {
+      showToast('error', 'Creation Failed', err?.message || 'Could not create warehouse');
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   return (
@@ -69,76 +99,85 @@ export const WarehousesView: React.FC<WarehousesViewProps> = ({ onNavigate }) =>
         </button>
       </div>
 
-      {/* Warehouse Cards Grid */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: 18 }}>
-        {warehouses.map((w) => {
-          const whLocs = locations.filter((l) => l.warehouseId === w.id);
-          const quantsInWh = inventoryEngine.getQuants(undefined, w.id);
-          const totalUnits = quantsInWh.reduce((s, q) => s + q.quantity, 0);
+      {loading && (
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '48px 0', gap: 12 }}>
+          <Loader2 size={28} color="#6D28D9" className="animate-spin" />
+          <span style={{ color: '#64748B', fontSize: 14 }}>Loading facilities…</span>
+        </div>
+      )}
 
-          return (
-            <div key={w.id} className="card" style={{ padding: '22px', display: 'flex', flexDirection: 'column', gap: 14 }}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                  <div
-                    style={{
-                      width: 42,
-                      height: 42,
-                      borderRadius: 10,
-                      background: '#F5F3FF',
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                    }}
-                  >
-                    <Building2 size={22} color="#6D28D9" />
+      {/* Warehouse Cards Grid */}
+      {!loading && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: 18 }}>
+          {warehouses.map((w) => {
+            const whLocs = locations.filter((l) => l.warehouseId === w.id);
+            const quantsInWh = stocks.filter((s) => s.warehouseId === w.id);
+            const totalUnits = quantsInWh.reduce((s, q) => s + q.quantityOnHand, 0);
+
+            return (
+              <div key={w.id} className="card" style={{ padding: '22px', display: 'flex', flexDirection: 'column', gap: 14 }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                    <div
+                      style={{
+                        width: 42,
+                        height: 42,
+                        borderRadius: 10,
+                        background: '#F5F3FF',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                      }}
+                    >
+                      <Building2 size={22} color="#6D28D9" />
+                    </div>
+                    <div>
+                      <h3 style={{ fontSize: 16, color: '#0F172A' }}>{w.name}</h3>
+                      <span className="badge badge-purple" style={{ fontSize: 11, marginTop: 2 }}>{w.code}</span>
+                    </div>
+                  </div>
+                  <span className="badge badge-success">Active</span>
+                </div>
+
+                <div style={{ fontSize: 13, color: '#64748B', display: 'flex', alignItems: 'flex-start', gap: 6 }}>
+                  <MapPin size={16} color="#94A3B8" style={{ flexShrink: 0, marginTop: 2 }} />
+                  <span>{w.address || 'Standard facility'}</span>
+                </div>
+
+                <div
+                  style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    padding: '10px 14px',
+                    background: '#F8FAFC',
+                    borderRadius: 8,
+                    fontSize: 12.5,
+                  }}
+                >
+                  <div>
+                    <span style={{ color: '#64748B' }}>Storage Racks: </span>
+                    <strong>{whLocs.length}</strong>
                   </div>
                   <div>
-                    <h3 style={{ fontSize: 16, color: '#0F172A' }}>{w.name}</h3>
-                    <span className="badge badge-purple" style={{ fontSize: 11, marginTop: 2 }}>{w.code}</span>
+                    <span style={{ color: '#64748B' }}>Stored Units: </span>
+                    <strong style={{ color: '#6D28D9' }}>{totalUnits.toLocaleString()}</strong>
                   </div>
                 </div>
-                <span className="badge badge-success">Active</span>
-              </div>
 
-              <div style={{ fontSize: 13, color: '#64748B', display: 'flex', alignItems: 'flex-start', gap: 6 }}>
-                <MapPin size={16} color="#94A3B8" style={{ flexShrink: 0, marginTop: 2 }} />
-                <span>{w.address}</span>
-              </div>
-
-              <div
-                style={{
-                  display: 'flex',
-                  justifyContent: 'space-between',
-                  padding: '10px 14px',
-                  background: '#F8FAFC',
-                  borderRadius: 8,
-                  fontSize: 12.5,
-                }}
-              >
-                <div>
-                  <span style={{ color: '#64748B' }}>Storage Racks: </span>
-                  <strong>{whLocs.length}</strong>
-                </div>
-                <div>
-                  <span style={{ color: '#64748B' }}>Stored Units: </span>
-                  <strong style={{ color: '#6D28D9' }}>{totalUnits.toLocaleString()}</strong>
+                <div style={{ display: 'flex', gap: 10, marginTop: 4 }}>
+                  <button
+                    onClick={() => onNavigate('stock-location')}
+                    className="btn btn-sm btn-outline-purple"
+                    style={{ flex: 1 }}
+                  >
+                    Manage Racks
+                  </button>
                 </div>
               </div>
-
-              <div style={{ display: 'flex', gap: 10, marginTop: 4 }}>
-                <button
-                  onClick={() => onNavigate('stock-location')}
-                  className="btn btn-sm btn-outline-purple"
-                  style={{ flex: 1 }}
-                >
-                  Manage Racks
-                </button>
-              </div>
-            </div>
-          );
-        })}
-      </div>
+            );
+          })}
+        </div>
+      )}
 
       {/* Modal */}
       {isModalOpen && (
@@ -200,11 +239,11 @@ export const WarehousesView: React.FC<WarehousesViewProps> = ({ onNavigate }) =>
               </div>
 
               <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12, marginTop: 8 }}>
-                <button type="button" onClick={() => setIsModalOpen(false)} className="btn btn-outline">
+                <button type="button" onClick={() => setIsModalOpen(false)} className="btn btn-outline" disabled={submitting}>
                   Cancel
                 </button>
-                <button type="submit" className="btn btn-primary" style={{ background: '#6D28D9' }}>
-                  Save Warehouse
+                <button type="submit" className="btn btn-primary" style={{ background: '#6D28D9' }} disabled={submitting}>
+                  {submitting ? <Loader2 size={16} className="animate-spin" /> : 'Save Warehouse'}
                 </button>
               </div>
             </form>

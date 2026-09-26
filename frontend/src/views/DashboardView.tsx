@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Package,
   AlertTriangle,
@@ -13,91 +13,111 @@ import {
   CheckCircle2,
   MapPin,
   Bot,
-  ExternalLink,
-  ChevronRight,
-  Layers,
+  Loader2,
+  RefreshCw,
 } from 'lucide-react';
-import { inventoryEngine } from '../services/inventoryEngine';
-import { DashboardStats, Product, StockLedgerEntry } from '../types';
+import { dashboardService, stockService, locationService } from '../services/api';
+import { useAuth } from '../contexts/AuthContext';
+import { DashboardData, StockResponse, LocationResponse } from '../types';
 import { RouteId } from '../components/Sidebar';
 
 interface DashboardViewProps {
-  stats: DashboardStats;
-  selectedWarehouse: string;
+  selectedWarehouse?: string;
   onNavigate: (route: RouteId, targetId?: string) => void;
   onOpenNewReceipt: () => void;
   onOpenNewDelivery: () => void;
   onOpenNewTransfer: () => void;
   onOpenAi: () => void;
+  refreshKey?: number;
 }
 
 export const DashboardView: React.FC<DashboardViewProps> = ({
-  stats,
   selectedWarehouse,
   onNavigate,
   onOpenNewReceipt,
   onOpenNewDelivery,
   onOpenNewTransfer,
   onOpenAi,
+  refreshKey = 0,
 }) => {
-  const user = inventoryEngine.getUser();
-  const products = inventoryEngine.getProducts();
-  const locationBreakdown = inventoryEngine.getStockByLocationBreakdown();
-  const ledgerMovements = inventoryEngine.getLedger().slice(0, 4);
+  const { user } = useAuth();
+  const [data, setData] = useState<DashboardData | null>(null);
+  const [stocks, setStocks] = useState<StockResponse[]>([]);
+  const [locations, setLocations] = useState<LocationResponse[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
-  // Filter risk products
-  const riskProducts = products.filter(
-    (p) => p.status === 'Out of Stock' || p.status === 'Below Minimum' || p.status === 'Low Stock' || p.status === 'High Consumption'
-  ).slice(0, 4);
+  const fetchDashboardData = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const [dashRes, stockRes, locRes] = await Promise.all([
+        dashboardService.getDashboard(),
+        stockService.list().catch(() => [] as StockResponse[]),
+        locationService.list().catch(() => [] as LocationResponse[]),
+      ]);
+      setData(dashRes);
+      setStocks(stockRes || []);
+      setLocations(locRes || []);
+    } catch (err: any) {
+      console.error('Failed to load dashboard:', err);
+      setError(err?.message || 'Unable to load dashboard data. Please verify backend connection.');
+    } finally {
+      setLoading(false);
+    }
+  };
 
-  // Operations Today list
-  const state = inventoryEngine.getState();
-  const operationsToday = [
-    ...state.receipts.slice(0, 1).map((r) => ({
-      id: r.reference,
-      type: 'Receipt',
-      product: r.items[0]?.productName || 'Material',
-      qty: `+${r.items[0]?.receivedQty || r.items[0]?.orderedQty} ${r.items[0]?.uom}`,
-      status: r.status,
-      time: '09:12 AM',
-      color: '#10B981',
-      route: 'receipts' as RouteId,
-      rawId: r.id,
-    })),
-    ...state.deliveries.slice(0, 1).map((d) => ({
-      id: d.reference,
-      type: 'Delivery',
-      product: d.items[0]?.productName || 'Order',
-      qty: `-${d.items[0]?.requestedQty} ${d.items[0]?.uom}`,
-      status: d.status,
-      time: '11:10 AM',
-      color: '#EF4444',
-      route: 'deliveries' as RouteId,
-      rawId: d.id,
-    })),
-    ...state.transfers.slice(0, 1).map((t) => ({
-      id: t.reference,
-      type: 'Transfer',
-      product: t.items[0]?.productName || 'Relocation',
-      qty: `+${t.items[0]?.quantity} ${t.items[0]?.uom}`,
-      status: t.status === 'Done' ? 'Done' : 'Waiting',
-      time: '01:24 PM',
-      color: '#F59E0B',
-      route: 'transfers' as RouteId,
-      rawId: t.id,
-    })),
-    ...state.adjustments.slice(0, 1).map((a) => ({
-      id: a.reference,
-      type: 'Adjustment',
-      product: a.productName,
-      qty: `${a.variance > 0 ? '+' : ''}${a.variance} ${a.uom}`,
-      status: 'Done',
-      time: '12:20 PM',
-      color: '#EF4444',
-      route: 'adjustments' as RouteId,
-      rawId: a.id,
-    })),
-  ];
+  useEffect(() => {
+    fetchDashboardData();
+  }, [refreshKey]);
+
+  if (loading && !data) {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: 400, gap: 16 }}>
+        <Loader2 size={36} color="#6D28D9" className="animate-spin" />
+        <span style={{ color: '#64748B', fontWeight: 500, fontSize: 14 }}>Loading inventory dashboard…</span>
+      </div>
+    );
+  }
+
+  if (error && !data) {
+    return (
+      <div style={{ padding: 32, textAlign: 'center', background: '#FEF2F2', borderRadius: 12, border: '1px solid #FECACA', margin: '20px 0' }}>
+        <AlertCircle size={40} color="#DC2626" style={{ margin: '0 auto 12px' }} />
+        <h3 style={{ color: '#991B1B', fontWeight: 700, fontSize: 18 }}>Failed to load dashboard data</h3>
+        <p style={{ color: '#7F1D1D', fontSize: 14, margin: '8px 0 20px' }}>{error}</p>
+        <button
+          onClick={fetchDashboardData}
+          className="btn btn-primary"
+          style={{ background: '#DC2626', display: 'inline-flex', alignItems: 'center', gap: 8 }}
+        >
+          <RefreshCw size={16} />
+          <span>Retry Connection</span>
+        </button>
+      </div>
+    );
+  }
+
+  const lowStockItems = data?.lowStockItems || [];
+  const recentMovements = data?.recentMovements || [];
+
+  // Compute physical stock by location breakdown
+  const locMap: Record<string, { id: number; name: string; quantity: number }> = {};
+  let totalStockUnits = 0;
+  stocks.forEach((s) => {
+    totalStockUnits += s.quantityOnHand;
+    const locId = String(s.locationId);
+    if (!locMap[locId]) {
+      locMap[locId] = { id: s.locationId, name: s.locationName || s.locationCode || 'Storage Rack', quantity: 0 };
+    }
+    locMap[locId].quantity += s.quantityOnHand;
+  });
+
+  const locationBreakdownList = Object.values(locMap)
+    .sort((a, b) => b.quantity - a.quantity)
+    .slice(0, 4);
+
+  const colors = ['#6D28D9', '#3B82F6', '#10B981', '#F59E0B', '#94A3B8'];
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
@@ -105,10 +125,10 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 16 }}>
         <div>
           <h1 style={{ fontSize: 26, color: '#0F172A', display: 'flex', alignItems: 'center', gap: 8 }}>
-            Good morning, {user.name.split(' ')[0]} 👋
+            Good day, {user?.name ? user.name.split(' ')[0] : 'Manager'} 👋
           </h1>
           <p style={{ color: '#64748B', fontSize: 14, marginTop: 4 }}>
-            Here's a quick overview of your inventory today.
+            Here's a live overview of your enterprise inventory state.
           </p>
         </div>
 
@@ -163,10 +183,10 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           gap: 16,
         }}
       >
-        {/* KPI 1: Total Stock */}
+        {/* KPI 1: Total Products */}
         <div
           className="card"
-          onClick={() => onNavigate('stock')}
+          onClick={() => onNavigate('products')}
           style={{ padding: '20px', cursor: 'pointer', position: 'relative' }}
         >
           <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between' }}>
@@ -184,15 +204,15 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               <Package size={22} color="#6D28D9" />
             </div>
             <span style={{ fontSize: 12, color: '#10B981', display: 'flex', alignItems: 'center', gap: 3, fontWeight: 600 }}>
-              <TrendingUp size={13} /> +4% vs. last week
+              <TrendingUp size={13} /> Active Catalog
             </span>
           </div>
           <div style={{ marginTop: 14 }}>
             <div style={{ fontSize: 13, color: '#64748B', fontWeight: 500 }}>Total Products</div>
             <div style={{ fontSize: 28, fontWeight: 800, color: '#0F172A', marginTop: 2, letterSpacing: '-0.02em' }}>
-              {stats.totalStockUnits.toLocaleString()}
+              {data?.totalProducts ?? 0}
             </div>
-            <div style={{ fontSize: 12, color: '#94A3B8', marginTop: 2 }}>in stock</div>
+            <div style={{ fontSize: 12, color: '#94A3B8', marginTop: 2 }}>SKUs managed</div>
           </div>
         </div>
 
@@ -221,9 +241,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           <div style={{ marginTop: 14 }}>
             <div style={{ fontSize: 13, color: '#64748B', fontWeight: 500 }}>Low Stock</div>
             <div style={{ fontSize: 28, fontWeight: 800, color: '#0F172A', marginTop: 2, letterSpacing: '-0.02em' }}>
-              {stats.lowStockCount}
+              {data?.lowStockCount ?? 0}
             </div>
-            <div style={{ fontSize: 12, color: '#94A3B8', marginTop: 2 }}>products</div>
+            <div style={{ fontSize: 12, color: '#94A3B8', marginTop: 2 }}>products below threshold</div>
           </div>
         </div>
 
@@ -252,9 +272,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           <div style={{ marginTop: 14 }}>
             <div style={{ fontSize: 13, color: '#64748B', fontWeight: 500 }}>Out of Stock</div>
             <div style={{ fontSize: 28, fontWeight: 800, color: '#0F172A', marginTop: 2, letterSpacing: '-0.02em' }}>
-              {stats.outOfStockCount}
+              {data?.outOfStockCount ?? 0}
             </div>
-            <div style={{ fontSize: 12, color: '#94A3B8', marginTop: 2 }}>products</div>
+            <div style={{ fontSize: 12, color: '#94A3B8', marginTop: 2 }}>products at zero stock</div>
           </div>
         </div>
 
@@ -278,18 +298,18 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             >
               <FileText size={22} color="#3B82F6" />
             </div>
-            <span style={{ fontSize: 12, color: '#3B82F6', fontWeight: 600 }}>awaiting delivery</span>
+            <span style={{ fontSize: 12, color: '#3B82F6', fontWeight: 600 }}>inbound queue</span>
           </div>
           <div style={{ marginTop: 14 }}>
             <div style={{ fontSize: 13, color: '#64748B', fontWeight: 500 }}>Pending Receipts</div>
             <div style={{ fontSize: 28, fontWeight: 800, color: '#0F172A', marginTop: 2, letterSpacing: '-0.02em' }}>
-              {stats.pendingReceiptsCount}
+              {data?.pendingReceipts ?? 0}
             </div>
-            <div style={{ fontSize: 12, color: '#94A3B8', marginTop: 2 }}>orders</div>
+            <div style={{ fontSize: 12, color: '#94A3B8', marginTop: 2 }}>incoming orders</div>
           </div>
         </div>
 
-        {/* KPI 5: Pending Transfers */}
+        {/* KPI 5: Pending Transfers / Deliveries */}
         <div
           className="card"
           onClick={() => onNavigate('transfers')}
@@ -309,14 +329,14 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             >
               <ArrowLeftRight size={22} color="#6D28D9" />
             </div>
-            <span style={{ fontSize: 12, color: '#6D28D9', fontWeight: 600 }}>in progress</span>
+            <span style={{ fontSize: 12, color: '#6D28D9', fontWeight: 600 }}>internal moves</span>
           </div>
           <div style={{ marginTop: 14 }}>
             <div style={{ fontSize: 13, color: '#64748B', fontWeight: 500 }}>Pending Transfers</div>
             <div style={{ fontSize: 28, fontWeight: 800, color: '#0F172A', marginTop: 2, letterSpacing: '-0.02em' }}>
-              {stats.pendingTransfersCount}
+              {data?.pendingTransfers ?? 0}
             </div>
-            <div style={{ fontSize: 12, color: '#94A3B8', marginTop: 2 }}>moves</div>
+            <div style={{ fontSize: 12, color: '#94A3B8', marginTop: 2 }}>active internal moves</div>
           </div>
         </div>
       </div>
@@ -344,7 +364,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 </div>
                 <div>
                   <h3 style={{ fontSize: 16, color: '#0F172A' }}>Inventory Risk Center</h3>
-                  <div style={{ fontSize: 12, color: '#64748B' }}>Products that need your attention</div>
+                  <div style={{ fontSize: 12, color: '#64748B' }}>Products needing immediate replenishment</div>
                 </div>
               </div>
               <button
@@ -372,87 +392,81 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   <tr>
                     <th>Product</th>
                     <th>Current Stock</th>
+                    <th>Min / Reorder</th>
                     <th>Status</th>
                     <th style={{ textAlign: 'right' }}>Action</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {riskProducts.map((p) => {
-                    let badgeClass = 'badge-warning';
-                    let actionText = 'View';
-
-                    if (p.status === 'Out of Stock') {
-                      badgeClass = 'badge-danger';
-                      actionText = 'Reorder';
-                    } else if (p.status === 'Below Minimum') {
-                      badgeClass = 'badge-warning';
-                      actionText = 'Recommend';
-                    } else if (p.status === 'High Consumption') {
-                      badgeClass = 'badge-info';
-                      actionText = 'View';
-                    }
-
-                    return (
-                      <tr key={p.id}>
-                        <td>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                            <div
-                              style={{
-                                width: 34,
-                                height: 34,
-                                borderRadius: 8,
-                                background: '#F1F5F9',
-                                display: 'flex',
-                                alignItems: 'center',
-                                justifyContent: 'center',
-                                flexShrink: 0,
-                              }}
-                            >
-                              <Package size={17} color="#64748B" />
-                            </div>
-                            <div>
+                  {lowStockItems.length === 0 ? (
+                    <tr>
+                      <td colSpan={5} style={{ textAlign: 'center', padding: '28px', color: '#10B981', fontWeight: 500 }}>
+                        <CheckCircle2 size={24} style={{ margin: '0 auto 6px', display: 'block' }} />
+                        All inventory levels are healthy!
+                      </td>
+                    </tr>
+                  ) : (
+                    lowStockItems.slice(0, 5).map((p) => {
+                      const isOutOfStock = p.quantityOnHand <= 0;
+                      return (
+                        <tr key={p.productId}>
+                          <td>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
                               <div
-                                style={{ fontWeight: 600, color: '#0F172A', cursor: 'pointer' }}
-                                onClick={() => onNavigate('products', p.id)}
+                                style={{
+                                  width: 34,
+                                  height: 34,
+                                  borderRadius: 8,
+                                  background: '#F1F5F9',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  justifyContent: 'center',
+                                  flexShrink: 0,
+                                }}
                               >
-                                {p.name}
+                                <Package size={17} color="#64748B" />
                               </div>
-                              <div style={{ fontSize: 11.5, color: '#64748B' }}>{p.sku}</div>
+                              <div>
+                                <div
+                                  style={{ fontWeight: 600, color: '#0F172A', cursor: 'pointer' }}
+                                  onClick={() => onNavigate('products', String(p.productId))}
+                                >
+                                  {p.productName}
+                                </div>
+                                <div style={{ fontSize: 11.5, color: '#64748B' }}>{p.sku}</div>
+                              </div>
                             </div>
-                          </div>
-                        </td>
-                        <td style={{ fontWeight: 600, color: '#0F172A' }}>
-                          {p.totalStock} {p.uom}
-                        </td>
-                        <td>
-                          <span className={`badge ${badgeClass}`}>
-                            <span className="badge-dot" />
-                            {p.status}
-                          </span>
-                        </td>
-                        <td style={{ textAlign: 'right' }}>
-                          <button
-                            onClick={() => {
-                              if (actionText === 'Reorder' || actionText === 'Recommend') {
-                                onNavigate('reorder');
-                              } else {
-                                onNavigate('products', p.id);
-                              }
-                            }}
-                            className="btn btn-sm btn-outline-purple"
-                          >
-                            {actionText}
-                          </button>
-                        </td>
-                      </tr>
-                    );
-                  })}
+                          </td>
+                          <td style={{ fontWeight: 600, color: isOutOfStock ? '#EF4444' : '#F59E0B' }}>
+                            {p.quantityOnHand} units
+                          </td>
+                          <td style={{ color: '#64748B', fontSize: 13 }}>
+                            {p.reorderLevel} units
+                          </td>
+                          <td>
+                            <span className={`badge ${isOutOfStock ? 'badge-danger' : 'badge-warning'}`}>
+                              <span className="badge-dot" />
+                              {isOutOfStock ? 'Out of Stock' : 'Low Stock'}
+                            </span>
+                          </td>
+                          <td style={{ textAlign: 'right' }}>
+                            <button
+                              onClick={() => onNavigate('reorder')}
+                              className="btn btn-sm btn-outline-purple"
+                            >
+                              Reorder
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
                 </tbody>
               </table>
             </div>
           </div>
 
-          {/* Card: Operations Today */}
+          {/* Card: Operations Activity */}
           <div className="card" style={{ padding: '22px' }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -470,8 +484,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   <FileText size={18} color="#6D28D9" />
                 </div>
                 <div>
-                  <h3 style={{ fontSize: 16, color: '#0F172A' }}>Operations Today</h3>
-                  <div style={{ fontSize: 12, color: '#64748B' }}>Real-time inventory operation activity</div>
+                  <h3 style={{ fontSize: 16, color: '#0F172A' }}>Recent Operations</h3>
+                  <div style={{ fontSize: 12, color: '#64748B' }}>Real-time warehouse movement ledger</div>
                 </div>
               </div>
               <button
@@ -497,42 +511,67 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               <table className="enterprise-table">
                 <thead>
                   <tr>
-                    <th>ID</th>
+                    <th>Reference</th>
                     <th>Type</th>
-                    <th>Product</th>
-                    <th>Quantity</th>
+                    <th>Destination / Partner</th>
                     <th>Status</th>
-                    <th>Time</th>
+                    <th>Date</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {operationsToday.map((op, idx) => (
-                    <tr
-                      key={idx}
-                      style={{ cursor: 'pointer' }}
-                      onClick={() => onNavigate(op.route, op.rawId)}
-                    >
-                      <td style={{ fontWeight: 600, color: '#6D28D9' }}>{op.id}</td>
-                      <td>{op.type}</td>
-                      <td style={{ color: '#0F172A', fontWeight: 500 }}>{op.product}</td>
-                      <td style={{ fontWeight: 600, color: op.color }}>{op.qty}</td>
-                      <td>
-                        <span
-                          className={`badge ${
-                            op.status === 'Done'
-                              ? 'badge-success'
-                              : op.status === 'Ready'
-                              ? 'badge-info'
-                              : 'badge-warning'
-                          }`}
-                        >
-                          <span className="badge-dot" />
-                          {op.status}
-                        </span>
+                  {recentMovements.length === 0 ? (
+                    <tr>
+                      <td colSpan={5} style={{ textAlign: 'center', padding: '24px', color: '#94A3B8' }}>
+                        No inventory movements recorded yet.
                       </td>
-                      <td style={{ color: '#64748B', fontSize: 12 }}>{op.time}</td>
                     </tr>
-                  ))}
+                  ) : (
+                    recentMovements.slice(0, 5).map((op) => {
+                      const route =
+                        op.type === 'RECEIPT'
+                          ? 'receipts'
+                          : op.type === 'DELIVERY'
+                          ? 'deliveries'
+                          : op.type === 'INTERNAL'
+                          ? 'transfers'
+                          : 'adjustments';
+
+                      return (
+                        <tr
+                          key={op.documentId}
+                          style={{ cursor: 'pointer' }}
+                          onClick={() => onNavigate(route as RouteId, op.documentId)}
+                        >
+                          <td style={{ fontWeight: 600, color: '#6D28D9' }}>{op.reference}</td>
+                          <td>
+                            <span className="badge badge-purple" style={{ fontSize: 11 }}>
+                              {op.type}
+                            </span>
+                          </td>
+                          <td style={{ color: '#0F172A', fontWeight: 500 }}>
+                            {op.partnerName || op.destinationLocationName || 'Warehouse'}
+                          </td>
+                          <td>
+                            <span
+                              className={`badge ${
+                                op.status === 'DONE'
+                                  ? 'badge-success'
+                                  : op.status === 'READY'
+                                  ? 'badge-info'
+                                  : 'badge-warning'
+                              }`}
+                            >
+                              <span className="badge-dot" />
+                              {op.status}
+                            </span>
+                          </td>
+                          <td style={{ color: '#64748B', fontSize: 12 }}>
+                            {op.createdAt ? new Date(op.createdAt).toLocaleDateString() : 'Today'}
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
                 </tbody>
               </table>
             </div>
@@ -560,7 +599,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 </div>
                 <div>
                   <h3 style={{ fontSize: 16, color: '#0F172A' }}>Stock by Location</h3>
-                  <div style={{ fontSize: 12, color: '#64748B' }}>Inventory physical distribution</div>
+                  <div style={{ fontSize: 12, color: '#64748B' }}>Physical distribution across facilities</div>
                 </div>
               </div>
               <button
@@ -577,208 +616,54 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   gap: 4,
                 }}
               >
-                <span>View All</span>
+                <span>Hierarchy</span>
                 <ArrowRight size={14} />
               </button>
             </div>
 
-            {/* Donut Chart & Legend */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: 24, padding: '10px 0' }}>
-              {/* Donut Chart SVG */}
-              <div style={{ position: 'relative', width: 140, height: 140, flexShrink: 0 }}>
-                <svg viewBox="0 0 100 100" width="140" height="140">
-                  {/* Background track */}
-                  <circle cx="50" cy="50" r="38" fill="none" stroke="#F1F5F9" strokeWidth="16" />
-                  {/* Segments: Main Warehouse (50%), Production (27%), Warehouse 2 (15%), Other (8%) */}
-                  {/* Circumference = 2 * PI * 38 = 238.76 */}
-                  <circle
-                    cx="50"
-                    cy="50"
-                    r="38"
-                    fill="none"
-                    stroke="#6D28D9"
-                    strokeWidth="16"
-                    strokeDasharray="119.38 238.76"
-                    strokeDashoffset="0"
-                    transform="rotate(-90 50 50)"
-                  />
-                  <circle
-                    cx="50"
-                    cy="50"
-                    r="38"
-                    fill="none"
-                    stroke="#3B82F6"
-                    strokeWidth="16"
-                    strokeDasharray="64.46 238.76"
-                    strokeDashoffset="-119.38"
-                    transform="rotate(-90 50 50)"
-                  />
-                  <circle
-                    cx="50"
-                    cy="50"
-                    r="38"
-                    fill="none"
-                    stroke="#10B981"
-                    strokeWidth="16"
-                    strokeDasharray="35.81 238.76"
-                    strokeDashoffset="-183.84"
-                    transform="rotate(-90 50 50)"
-                  />
-                  <circle
-                    cx="50"
-                    cy="50"
-                    r="38"
-                    fill="none"
-                    stroke="#94A3B8"
-                    strokeWidth="16"
-                    strokeDasharray="19.1 238.76"
-                    strokeDashoffset="-219.65"
-                    transform="rotate(-90 50 50)"
-                  />
-                </svg>
-                {/* Center text */}
-                <div
-                  style={{
-                    position: 'absolute',
-                    inset: 0,
-                    display: 'flex',
-                    flexDirection: 'column',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                  }}
-                >
-                  <span style={{ fontSize: 16, fontWeight: 800, color: '#0F172A', lineHeight: 1 }}>
-                    {locationBreakdown.total.toLocaleString()}
-                  </span>
-                  <span style={{ fontSize: 10, color: '#64748B', marginTop: 2 }}>Total Units</span>
-                </div>
-              </div>
-
-              {/* Legend List */}
-              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 10 }}>
-                {locationBreakdown.breakdown.map((item) => (
-                  <div
-                    key={item.id}
-                    onClick={() => onNavigate('stock-location')}
-                    style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'space-between',
-                      fontSize: 12.5,
-                      cursor: 'pointer',
-                    }}
-                  >
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                      <span
-                        style={{
-                          width: 8,
-                          height: 8,
-                          borderRadius: '50%',
-                          background: item.color,
-                        }}
-                      />
-                      <span style={{ color: '#334155', fontWeight: 500 }}>{item.name}</span>
-                    </div>
-                    <div style={{ color: '#0F172A', fontWeight: 600 }}>
-                      {item.quantity.toLocaleString()} <span style={{ color: '#94A3B8', fontWeight: 400 }}>({item.percentage}%)</span>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-
-          {/* Card: Recent Stock Movement */}
-          <div className="card" style={{ padding: '22px' }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                <div
-                  style={{
-                    width: 32,
-                    height: 32,
-                    borderRadius: 8,
-                    background: '#F5F3FF',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                  }}
-                >
-                  <ArrowLeftRight size={18} color="#6D28D9" />
-                </div>
-                <div>
-                  <h3 style={{ fontSize: 16, color: '#0F172A' }}>Recent Stock Movement</h3>
-                  <div style={{ fontSize: 12, color: '#64748B' }}>Traceable inventory ledger log</div>
-                </div>
-              </div>
-              <button
-                onClick={() => onNavigate('ledger')}
-                style={{
-                  background: 'none',
-                  border: 'none',
-                  color: '#6D28D9',
-                  fontSize: 12.5,
-                  fontWeight: 600,
-                  cursor: 'pointer',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 4,
-                }}
-              >
-                <span>View Ledger</span>
-                <ArrowRight size={14} />
-              </button>
-            </div>
-
+            {/* Location List Breakdown */}
             <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-              {ledgerMovements.map((entry) => {
-                const isPositive = entry.quantity > 0;
-                return (
-                  <div
-                    key={entry.id}
-                    onClick={() => onNavigate('ledger')}
-                    style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'space-between',
-                      padding: '10px 12px',
-                      borderRadius: 8,
-                      background: '#F8FAFC',
-                      cursor: 'pointer',
-                      transition: 'background 0.15s ease',
-                    }}
-                    onMouseEnter={(e) => (e.currentTarget.style.background = '#F1F5F9')}
-                    onMouseLeave={(e) => (e.currentTarget.style.background = '#F8FAFC')}
-                  >
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                      <div
-                        style={{
-                          width: 36,
-                          height: 36,
-                          borderRadius: 8,
-                          background: isPositive ? '#ECFDF5' : '#FEF2F2',
-                          color: isPositive ? '#10B981' : '#EF4444',
-                          fontWeight: 700,
-                          fontSize: 12,
-                          display: 'flex',
-                          alignItems: 'center',
-                          justifyContent: 'center',
-                        }}
-                      >
-                        {isPositive ? `+${entry.quantity}` : `${entry.quantity}`}
+              {locationBreakdownList.length === 0 ? (
+                <div style={{ textAlign: 'center', padding: '24px', color: '#94A3B8', fontSize: 13 }}>
+                  No stock quantities recorded yet.
+                </div>
+              ) : (
+                locationBreakdownList.map((loc, idx) => {
+                  const pct = totalStockUnits > 0 ? Math.round((loc.quantity / totalStockUnits) * 100) : 0;
+                  return (
+                    <div
+                      key={loc.id}
+                      onClick={() => onNavigate('stock-location')}
+                      style={{
+                        padding: '12px 14px',
+                        borderRadius: 8,
+                        background: '#F8FAFC',
+                        cursor: 'pointer',
+                        transition: 'background 0.15s ease',
+                      }}
+                      onMouseEnter={(e) => (e.currentTarget.style.background = '#F1F5F9')}
+                      onMouseLeave={(e) => (e.currentTarget.style.background = '#F8FAFC')}
+                    >
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6, fontSize: 13 }}>
+                        <span style={{ fontWeight: 600, color: '#1E293B' }}>{loc.name}</span>
+                        <span style={{ color: '#6D28D9', fontWeight: 700 }}>
+                          {loc.quantity.toLocaleString()} units ({pct}%)
+                        </span>
                       </div>
-                      <div>
-                        <div style={{ fontWeight: 600, fontSize: 13, color: '#0F172A' }}>{entry.productName}</div>
-                        <div style={{ fontSize: 11.5, color: '#64748B' }}>
-                          {entry.type} • {entry.reference}
-                        </div>
+                      <div style={{ height: 6, background: '#E2E8F0', borderRadius: 4, overflow: 'hidden' }}>
+                        <div
+                          style={{
+                            height: '100%',
+                            width: `${pct}%`,
+                            background: colors[idx % colors.length],
+                            borderRadius: 4,
+                          }}
+                        />
                       </div>
                     </div>
-                    <div style={{ textAlign: 'right', fontSize: 11.5, color: '#94A3B8' }}>
-                      {entry.timestamp}
-                    </div>
-                  </div>
-                );
-              })}
+                  );
+                })
+              )}
             </div>
           </div>
 
@@ -786,7 +671,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           <div
             onClick={onOpenAi}
             style={{
-              padding: '16px 20px',
+              padding: '18px 20px',
               borderRadius: 14,
               background: 'linear-gradient(135deg, #F5F3FF 0%, #EDE9FE 100%)',
               border: '1px solid #DDD6FE',
@@ -796,27 +681,30 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               cursor: 'pointer',
             }}
           >
-            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
               <div
                 style={{
-                  width: 36,
-                  height: 36,
+                  width: 40,
+                  height: 40,
                   borderRadius: 10,
                   background: '#6D28D9',
                   color: '#FFFFFF',
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
+                  boxShadow: '0 3px 10px rgba(109, 40, 217, 0.3)',
                 }}
               >
-                <Bot size={20} />
+                <Bot size={22} />
               </div>
               <div>
-                <div style={{ fontWeight: 700, fontSize: 13.5, color: '#4C1D95' }}>Ask StockSense AI</div>
-                <div style={{ fontSize: 12, color: '#6D28D9' }}>Why is Steel Rod low? Which products need replenishment?</div>
+                <div style={{ fontWeight: 700, fontSize: 14, color: '#4C1D95' }}>Ask StockSense AI</div>
+                <div style={{ fontSize: 12, color: '#6D28D9', marginTop: 2 }}>
+                  Instant inventory diagnostics, consumption analysis, and reorder forecasts.
+                </div>
               </div>
             </div>
-            <ArrowRight size={18} color="#6D28D9" />
+            <ArrowRight size={20} color="#6D28D9" />
           </div>
         </div>
       </div>

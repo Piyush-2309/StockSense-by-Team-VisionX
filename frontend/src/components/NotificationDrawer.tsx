@@ -1,7 +1,16 @@
 import React from 'react';
 import { X, Bell, AlertTriangle, AlertCircle, Truck, ArrowDownToLine, Check, CheckCheck } from 'lucide-react';
-import { Notification } from '../types';
 import { RouteId } from './Sidebar';
+
+export interface Notification {
+  id: string;
+  title: string;
+  message: string;
+  type: string;
+  link: string;
+  isRead: boolean;
+  timestamp: string;
+}
 
 interface NotificationDrawerProps {
   isOpen: boolean;

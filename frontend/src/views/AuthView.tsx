@@ -1,31 +1,67 @@
 import React, { useState } from 'react';
-import { ShieldCheck, Mail, Lock, ArrowRight, CheckCircle2, RotateCcw } from 'lucide-react';
+import { ShieldCheck, Mail, Lock, ArrowRight, CheckCircle2, RotateCcw, Loader2, User } from 'lucide-react';
 import { RouteId } from '../components/Sidebar';
 import { useToast } from '../components/Toast';
+import { useAuth } from '../contexts/AuthContext';
+import { ApiRequestError } from '../services/apiClient';
 
 interface AuthViewProps {
-  onLoginSuccess: () => void;
+  // No longer needs onLoginSuccess — AuthContext drives the gate
 }
 
 type AuthMode = 'login' | 'signup' | 'forgot' | 'otp';
 
-export const AuthView: React.FC<AuthViewProps> = ({ onLoginSuccess }) => {
+export const AuthView: React.FC<AuthViewProps> = () => {
   const { showToast } = useToast();
+  const { login, signup } = useAuth();
   const [mode, setMode] = useState<AuthMode>('login');
-  const [email, setEmail] = useState('tejas@stocksense.com');
-  const [password, setPassword] = useState('••••••••••••');
-  const [otp, setOtp] = useState(['4', '8', '2', '6', '3', '1']);
+  const [email, setEmail] = useState('manager@stocksense.com');
+  const [password, setPassword] = useState('Password123');
+  const [signupName, setSignupName] = useState('');
+  const [signupEmail, setSignupEmail] = useState('');
+  const [signupPassword, setSignupPassword] = useState('');
+  const [otp, setOtp] = useState(['', '', '', '', '', '']);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
 
-  const handleLogin = (e: React.FormEvent) => {
+  const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
-    showToast('success', 'Authentication Successful', 'Welcome back, Tejas Sharma!');
-    onLoginSuccess();
+    setIsSubmitting(true);
+    setFormError(null);
+    try {
+      await login(email, password);
+      showToast('success', 'Authentication Successful', `Welcome back!`);
+    } catch (err) {
+      const msg = err instanceof ApiRequestError ? err.message : 'Unable to connect to the server.';
+      setFormError(msg);
+      showToast('error', 'Login Failed', msg);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleSignup = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setIsSubmitting(true);
+    setFormError(null);
+    try {
+      await signup(signupName, signupEmail, signupPassword);
+      showToast('success', 'Account Created', 'Your account has been registered. Please sign in.');
+      setMode('login');
+      setEmail(signupEmail);
+      setPassword('');
+    } catch (err) {
+      const msg = err instanceof ApiRequestError ? err.message : 'Unable to connect to the server.';
+      setFormError(msg);
+      showToast('error', 'Signup Failed', msg);
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   const handleVerifyOtp = (e: React.FormEvent) => {
     e.preventDefault();
-    showToast('success', 'OTP Verified', 'Authentication code confirmed.');
-    onLoginSuccess();
+    showToast('info', 'OTP', 'OTP verification is handled server-side via /api/v1/auth/verify-otp.');
   };
 
   return (
@@ -208,14 +244,25 @@ export const AuthView: React.FC<AuthViewProps> = ({ onLoginSuccess }) => {
                   <label htmlFor="remember" style={{ cursor: 'pointer' }}>Remember me on this browser</label>
                 </div>
 
+                {formError && (
+                  <div style={{ background: '#FEF2F2', border: '1px solid #FECACA', borderRadius: 8, padding: '10px 14px', fontSize: 13, color: '#DC2626' }}>
+                    {formError}
+                  </div>
+                )}
+
                 <button
                   type="submit"
                   className="btn btn-primary btn-lg"
-                  style={{ background: '#6D28D9', marginTop: 6 }}
+                  style={{ background: '#6D28D9', marginTop: 6, opacity: isSubmitting ? 0.7 : 1 }}
+                  disabled={isSubmitting}
                 >
-                  <span>Sign In</span>
-                  <ArrowRight size={16} />
+                  {isSubmitting ? <Loader2 size={16} style={{ animation: 'spin 1s linear infinite' }} /> : <span>Sign In</span>}
+                  {!isSubmitting && <ArrowRight size={16} />}
                 </button>
+
+                <div style={{ background: '#F5F3FF', borderRadius: 8, padding: '10px 14px', fontSize: 12, color: '#6D28D9', marginTop: 4 }}>
+                  <strong>Demo:</strong> manager@stocksense.com / Password123  •  staff@stocksense.com / Password123
+                </div>
 
                 <div style={{ textAlign: 'center', margin: '6px 0', fontSize: 12, color: '#94A3B8' }}>
                   — OR —
@@ -328,22 +375,28 @@ export const AuthView: React.FC<AuthViewProps> = ({ onLoginSuccess }) => {
                 </p>
               </div>
 
-              <form onSubmit={handleLogin} style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+              <form onSubmit={handleSignup} style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
                 <div>
                   <label className="input-label">Full Name</label>
-                  <input type="text" required defaultValue="Tejas Sharma" className="input-field" />
+                  <input type="text" required value={signupName} onChange={(e) => setSignupName(e.target.value)} className="input-field" />
                 </div>
                 <div>
                   <label className="input-label">Work Email</label>
-                  <input type="email" required defaultValue="tejas@stocksense.com" className="input-field" />
+                  <input type="email" required value={signupEmail} onChange={(e) => setSignupEmail(e.target.value)} className="input-field" />
                 </div>
                 <div>
                   <label className="input-label">Password</label>
-                  <input type="password" required defaultValue="password123" className="input-field" />
+                  <input type="password" required value={signupPassword} onChange={(e) => setSignupPassword(e.target.value)} className="input-field" />
                 </div>
 
-                <button type="submit" className="btn btn-primary btn-lg" style={{ background: '#6D28D9' }}>
-                  Register Account
+                {formError && (
+                  <div style={{ background: '#FEF2F2', border: '1px solid #FECACA', borderRadius: 8, padding: '10px 14px', fontSize: 13, color: '#DC2626' }}>
+                    {formError}
+                  </div>
+                )}
+
+                <button type="submit" className="btn btn-primary btn-lg" style={{ background: '#6D28D9', opacity: isSubmitting ? 0.7 : 1 }} disabled={isSubmitting}>
+                  {isSubmitting ? 'Registering...' : 'Register Account'}
                 </button>
 
                 <button type="button" onClick={() => setMode('login')} className="btn btn-outline">

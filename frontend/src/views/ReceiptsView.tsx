@@ -1,97 +1,175 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   ArrowDownToLine,
   Plus,
   Search,
   CheckCircle2,
-  Clock,
-  Building,
   Package,
   X,
-  Sparkles,
+  Loader2,
+  RefreshCw,
+  Building,
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
-import { inventoryEngine } from '../services/inventoryEngine';
-import { Receipt } from '../types';
+import { receiptService, productService, warehouseService, locationService } from '../services/api';
+import { DocumentResponse, ProductResponse, WarehouseResponse, LocationResponse } from '../types';
 import { useToast } from '../components/Toast';
 import { RouteId } from '../components/Sidebar';
 
 interface ReceiptsViewProps {
   onNavigate: (route: RouteId, targetId?: string) => void;
   openNewModalOnLoad?: boolean;
+  refreshKey?: number;
+  onMutationSuccess?: () => void;
 }
 
-export const ReceiptsView: React.FC<ReceiptsViewProps> = ({ onNavigate, openNewModalOnLoad }) => {
+export const ReceiptsView: React.FC<ReceiptsViewProps> = ({
+  onNavigate,
+  openNewModalOnLoad,
+  refreshKey = 0,
+  onMutationSuccess,
+}) => {
   const { showToast } = useToast();
-  const receipts = inventoryEngine.getReceipts();
-  const products = inventoryEngine.getProducts();
-  const warehouses = inventoryEngine.getWarehouses();
-  const locations = inventoryEngine.getLocations();
+  const [receipts, setReceipts] = useState<DocumentResponse[]>([]);
+  const [products, setProducts] = useState<ProductResponse[]>([]);
+  const [warehouses, setWarehouses] = useState<WarehouseResponse[]>([]);
+  const [locations, setLocations] = useState<LocationResponse[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
+  const [validatingId, setValidatingId] = useState<string | null>(null);
 
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
   const [isModalOpen, setIsModalOpen] = useState(openNewModalOnLoad || false);
-  const [selectedReceipt, setSelectedReceipt] = useState<Receipt | null>(null);
+  const [selectedReceipt, setSelectedReceipt] = useState<DocumentResponse | null>(null);
 
   // Form State
   const [formData, setFormData] = useState({
     supplier: '',
-    warehouseId: 'wh-main',
-    locationId: 'loc-rack-a',
-    productId: products[0]?.id || 'prod-steel-rod',
+    warehouseId: 0,
+    locationId: 0,
+    productId: 0,
     quantity: 50,
     notes: '',
   });
 
+  const fetchData = async () => {
+    setLoading(true);
+    try {
+      const [recRes, prodRes, whRes, locRes] = await Promise.all([
+        receiptService.list({ size: 100 }),
+        productService.list({ size: 100 }),
+        warehouseService.list(),
+        locationService.list(),
+      ]);
+      setReceipts(recRes.content || []);
+      setProducts(prodRes.content || []);
+      setWarehouses(whRes || []);
+      setLocations(locRes || []);
+
+      if (formData.productId === 0 && prodRes.content?.length > 0) {
+        setFormData((prev) => ({
+          ...prev,
+          productId: prodRes.content[0].id,
+          warehouseId: whRes[0]?.id || 0,
+          locationId: locRes[0]?.id || 0,
+        }));
+      }
+    } catch (err: any) {
+      console.error('Failed to load receipts:', err);
+      showToast('error', 'Load Error', err?.message || 'Failed to load receipts.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchData();
+  }, [refreshKey]);
+
+  useEffect(() => {
+    if (openNewModalOnLoad) {
+      setIsModalOpen(true);
+    }
+  }, [openNewModalOnLoad]);
+
   const filteredReceipts = receipts.filter((r) => {
     if (search) {
       const q = search.toLowerCase();
-      if (!r.reference.toLowerCase().includes(q) && !r.supplier.toLowerCase().includes(q)) {
-        return false;
-      }
+      const refMatch = r.reference?.toLowerCase().includes(q);
+      const supplierMatch = r.partnerName?.toLowerCase().includes(q);
+      if (!refMatch && !supplierMatch) return false;
     }
-    if (statusFilter !== 'all' && r.status !== statusFilter) {
-      return false;
+    if (statusFilter !== 'all') {
+      if (statusFilter === 'Done' && r.status !== 'DONE') return false;
+      if (statusFilter === 'Ready' && r.status !== 'READY') return false;
+      if (statusFilter === 'Draft' && r.status !== 'DRAFT') return false;
     }
     return true;
   });
 
-  const handleCreateReceipt = (e: React.FormEvent) => {
+  const handleCreateReceipt = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!formData.supplier.trim()) {
       showToast('error', 'Supplier Required', 'Please enter a vendor or supplier name.');
       return;
     }
 
-    const res = inventoryEngine.createReceipt({
-      supplier: formData.supplier,
-      warehouseId: formData.warehouseId,
-      locationId: formData.locationId,
-      items: [{ productId: formData.productId, orderedQty: Number(formData.quantity) || 1 }],
-      notes: formData.notes,
-    });
+    const locId = formData.locationId || locations[0]?.id;
+    if (!locId) {
+      showToast('error', 'Location Required', 'Please specify a destination storage location.');
+      return;
+    }
 
-    if (res.success && res.receipt) {
-      showToast('success', 'Receipt Draft Created', `Receipt ${res.receipt.reference} created. Click Validate to receive stock.`);
+    const prodId = formData.productId || products[0]?.id;
+    if (!prodId) {
+      showToast('error', 'Product Required', 'Please select a catalog product.');
+      return;
+    }
+
+    setSubmitting(true);
+    try {
+      const created = await receiptService.create({
+        supplier: formData.supplier.trim(),
+        destinationLocationId: locId,
+        items: [
+          {
+            productId: prodId,
+            quantity: Number(formData.quantity) || 1,
+          },
+        ],
+        notes: formData.notes.trim() || undefined,
+      });
+
+      showToast('success', 'Receipt Draft Created', `Receipt ${created.reference} created. Click Validate to receive stock.`);
       setIsModalOpen(false);
-      setSelectedReceipt(res.receipt);
-    } else {
-      showToast('error', 'Error', res.error);
+      setSelectedReceipt(created);
+      fetchData();
+      if (onMutationSuccess) onMutationSuccess();
+    } catch (err: any) {
+      showToast('error', 'Receipt Creation Failed', err?.message || 'Could not create receipt');
+    } finally {
+      setSubmitting(false);
     }
   };
 
-  const handleValidateReceipt = (receiptId: string) => {
-    const res = inventoryEngine.validateReceipt(receiptId);
-    if (res.success) {
+  const handleValidateReceipt = async (documentId: string) => {
+    setValidatingId(documentId);
+    try {
+      const updated = await receiptService.validate(documentId);
       confetti({
         particleCount: 70,
         spread: 60,
         origin: { y: 0.6 },
       });
-      showToast('success', 'Receipt Validated', res.message);
+      showToast('success', 'Receipt Validated', `Receipt ${updated.reference} validated. Physical stock balances increased.`);
       setSelectedReceipt(null);
-    } else {
-      showToast('error', 'Validation Failed', res.error);
+      fetchData();
+      if (onMutationSuccess) onMutationSuccess();
+    } catch (err: any) {
+      showToast('error', 'Validation Failed', err?.message || 'Could not validate receipt');
+    } finally {
+      setValidatingId(null);
     }
   };
 
@@ -100,9 +178,9 @@ export const ReceiptsView: React.FC<ReceiptsViewProps> = ({ onNavigate, openNewM
       {/* Header */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 16 }}>
         <div>
-          <h1 style={{ fontSize: 26, color: '#0F172A' }}>Receipts (Incoming Stock)</h1>
+          <h1 style={{ fontSize: 26, color: '#0F172A' }}>Receipts (Inbound Logistics)</h1>
           <p style={{ color: '#64748B', fontSize: 14, marginTop: 4 }}>
-            Inbound vendor shipments, supplier purchase orders, and goods receipts.
+            Receive purchase orders, raw materials, and inbound deliveries into warehouse locations.
           </p>
         </div>
         <button
@@ -116,18 +194,28 @@ export const ReceiptsView: React.FC<ReceiptsViewProps> = ({ onNavigate, openNewM
       </div>
 
       {/* Filter Bar */}
-      <div className="card" style={{ padding: '14px 18px', display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
+      <div
+        className="card"
+        style={{
+          padding: '14px 18px',
+          display: 'flex',
+          alignItems: 'center',
+          gap: 14,
+          flexWrap: 'wrap',
+        }}
+      >
         <div style={{ flex: 1, minWidth: 240, position: 'relative' }}>
           <Search size={16} color="#94A3B8" style={{ position: 'absolute', left: 12, top: 11 }} />
           <input
             type="text"
-            placeholder="Search by receipt reference, supplier..."
+            placeholder="Search by reference # or vendor..."
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             className="input-field"
             style={{ paddingLeft: 36 }}
           />
         </div>
+
         <div style={{ minWidth: 160 }}>
           <select
             value={statusFilter}
@@ -135,84 +223,114 @@ export const ReceiptsView: React.FC<ReceiptsViewProps> = ({ onNavigate, openNewM
             className="input-field"
           >
             <option value="all">All Statuses</option>
+            <option value="Done">Validated (Done)</option>
             <option value="Ready">Ready</option>
             <option value="Draft">Draft</option>
-            <option value="Done">Done</option>
           </select>
         </div>
       </div>
 
       {/* Receipts Table */}
       <div className="table-container">
-        <table className="enterprise-table">
-          <thead>
-            <tr>
-              <th>Reference</th>
-              <th>Supplier</th>
-              <th>Destination</th>
-              <th>Product Line</th>
-              <th>Quantity</th>
-              <th>Status</th>
-              <th>Date</th>
-              <th style={{ textAlign: 'right' }}>Action</th>
-            </tr>
-          </thead>
-          <tbody>
-            {filteredReceipts.map((r) => {
-              const item = r.items[0];
-              const qty = item ? item.receivedQty || item.orderedQty : 0;
-              const isDone = r.status === 'Done';
+        {loading && (
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '48px 0', gap: 12 }}>
+            <Loader2 size={28} color="#6D28D9" className="animate-spin" />
+            <span style={{ color: '#64748B', fontSize: 14 }}>Loading inbound receipts…</span>
+          </div>
+        )}
 
-              return (
-                <tr key={r.id}>
-                  <td style={{ fontWeight: 700, color: '#6D28D9', cursor: 'pointer' }} onClick={() => setSelectedReceipt(r)}>
-                    {r.reference}
-                  </td>
-                  <td style={{ fontWeight: 600, color: '#0F172A' }}>{r.supplier}</td>
-                  <td>
-                    {r.warehouseName} / {r.locationName}
-                  </td>
-                  <td>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                      <Package size={14} color="#64748B" />
-                      <span>{item?.productName || 'Items'}</span>
-                      <span style={{ fontSize: 11.5, color: '#94A3B8' }}>({item?.sku})</span>
+        {!loading && (
+          <table className="enterprise-table">
+            <thead>
+              <tr>
+                <th>Reference</th>
+                <th>Supplier / Vendor</th>
+                <th>Destination Location</th>
+                <th>Items & Quantities</th>
+                <th>Status</th>
+                <th>Date</th>
+                <th style={{ textAlign: 'right' }}>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filteredReceipts.length === 0 ? (
+                <tr>
+                  <td colSpan={7} style={{ textAlign: 'center', padding: '48px 20px', color: '#64748B' }}>
+                    <Package size={40} color="#CBD5E1" style={{ margin: '0 auto 10px' }} />
+                    <div style={{ fontWeight: 600, fontSize: 14 }}>No receipts found</div>
+                    <div style={{ fontSize: 12.5, color: '#94A3B8', marginTop: 4 }}>
+                      Create a new receipt to record incoming goods from suppliers.
                     </div>
                   </td>
-                  <td style={{ fontWeight: 700, color: '#10B981' }}>
-                    +{qty} {item?.uom}
-                  </td>
-                  <td>
-                    <span className={`badge ${isDone ? 'badge-success' : 'badge-warning'}`}>
-                      <span className="badge-dot" />
-                      {r.status}
-                    </span>
-                  </td>
-                  <td style={{ fontSize: 12, color: '#64748B' }}>{r.date}</td>
-                  <td style={{ textAlign: 'right' }}>
-                    {!isDone ? (
-                      <button
-                        onClick={() => handleValidateReceipt(r.id)}
-                        className="btn btn-sm btn-primary"
-                        style={{ background: '#10B981' }}
-                      >
-                        <CheckCircle2 size={13} />
-                        Validate
-                      </button>
-                    ) : (
-                      <button
-                        onClick={() => setSelectedReceipt(r)}
-                        className="btn btn-sm btn-outline"
-                      >
-                        View
-                      </button>
-                    )}
-                  </td>
                 </tr>
-              );
-            })}
-          </tbody>
-        </table>
+              ) : (
+                filteredReceipts.map((r) => {
+                  const isDone = r.status === 'DONE';
+                  const firstLine = r.lines[0];
+                  const lineSummary = firstLine
+                    ? `${firstLine.quantity} ${firstLine.unitOfMeasure} ${firstLine.productName}`
+                    : '1 item';
+
+                  return (
+                    <tr key={r.documentId}>
+                      <td style={{ fontWeight: 600, color: '#6D28D9' }}>{r.reference}</td>
+                      <td>
+                        <div style={{ fontWeight: 600, color: '#0F172A' }}>{r.partnerName || 'Vendor'}</div>
+                      </td>
+                      <td>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: '#334155' }}>
+                          <Building size={14} color="#64748B" />
+                          <span>{r.destinationWarehouseName || 'Warehouse'} / {r.destinationLocationName || 'Rack'}</span>
+                        </div>
+                      </td>
+                      <td style={{ fontWeight: 600, color: '#0F172A' }}>
+                        {lineSummary}
+                        {r.lines.length > 1 && (
+                          <span style={{ color: '#64748B', fontWeight: 400, fontSize: 12 }}>
+                            {' '}(+{r.lines.length - 1} more)
+                          </span>
+                        )}
+                      </td>
+                      <td>
+                        <span className={`badge ${isDone ? 'badge-success' : r.status === 'READY' ? 'badge-info' : 'badge-warning'}`}>
+                          <span className="badge-dot" />
+                          {r.status}
+                        </span>
+                      </td>
+                      <td style={{ color: '#64748B', fontSize: 13 }}>
+                        {r.createdAt ? new Date(r.createdAt).toLocaleDateString() : 'Today'}
+                      </td>
+                      <td style={{ textAlign: 'right' }}>
+                        {!isDone && r.status !== 'CANCELED' ? (
+                          <button
+                            onClick={() => handleValidateReceipt(r.documentId)}
+                            className="btn btn-sm btn-primary"
+                            style={{ background: '#10B981' }}
+                            disabled={validatingId === r.documentId}
+                          >
+                            {validatingId === r.documentId ? (
+                              <Loader2 size={13} className="animate-spin" />
+                            ) : (
+                              <CheckCircle2 size={13} />
+                            )}
+                            Validate
+                          </button>
+                        ) : (
+                          <button
+                            onClick={() => setSelectedReceipt(r)}
+                            className="btn btn-sm btn-outline"
+                          >
+                            View
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })
+              )}
+            </tbody>
+          </table>
+        )}
       </div>
 
       {/* New Receipt Modal */}
@@ -260,7 +378,7 @@ export const ReceiptsView: React.FC<ReceiptsViewProps> = ({ onNavigate, openNewM
                 <input
                   type="text"
                   required
-                  placeholder="e.g. ABC Metals Ltd, Global Spools"
+                  placeholder="e.g. Apex Industrial Supplies, Titan Steel Corp"
                   value={formData.supplier}
                   onChange={(e) => setFormData({ ...formData, supplier: e.target.value })}
                   className="input-field"
@@ -272,12 +390,12 @@ export const ReceiptsView: React.FC<ReceiptsViewProps> = ({ onNavigate, openNewM
                   <label className="input-label">Product to Receive</label>
                   <select
                     value={formData.productId}
-                    onChange={(e) => setFormData({ ...formData, productId: e.target.value })}
+                    onChange={(e) => setFormData({ ...formData, productId: Number(e.target.value) })}
                     className="input-field"
                   >
                     {products.map((p) => (
                       <option key={p.id} value={p.id}>
-                        {p.name} ({p.sku}) — {p.totalStock} {p.uom} on hand
+                        {p.name} ({p.sku}) — {p.totalStock} {p.unitOfMeasure} on hand
                       </option>
                     ))}
                   </select>
@@ -302,7 +420,11 @@ export const ReceiptsView: React.FC<ReceiptsViewProps> = ({ onNavigate, openNewM
                   <label className="input-label">Destination Warehouse</label>
                   <select
                     value={formData.warehouseId}
-                    onChange={(e) => setFormData({ ...formData, warehouseId: e.target.value })}
+                    onChange={(e) => {
+                      const whId = Number(e.target.value);
+                      const firstLoc = locations.find((l) => l.warehouseId === whId);
+                      setFormData({ ...formData, warehouseId: whId, locationId: firstLoc?.id || 0 });
+                    }}
                     className="input-field"
                   >
                     {warehouses.map((w) => (
@@ -316,11 +438,11 @@ export const ReceiptsView: React.FC<ReceiptsViewProps> = ({ onNavigate, openNewM
                   <label className="input-label">Destination Rack / Location</label>
                   <select
                     value={formData.locationId}
-                    onChange={(e) => setFormData({ ...formData, locationId: e.target.value })}
+                    onChange={(e) => setFormData({ ...formData, locationId: Number(e.target.value) })}
                     className="input-field"
                   >
                     {locations
-                      .filter((l) => l.warehouseId === formData.warehouseId)
+                      .filter((l) => !formData.warehouseId || l.warehouseId === formData.warehouseId)
                       .map((l) => (
                         <option key={l.id} value={l.id}>
                           {l.name} ({l.code})
@@ -342,11 +464,11 @@ export const ReceiptsView: React.FC<ReceiptsViewProps> = ({ onNavigate, openNewM
               </div>
 
               <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12, marginTop: 8 }}>
-                <button type="button" onClick={() => setIsModalOpen(false)} className="btn btn-outline">
+                <button type="button" onClick={() => setIsModalOpen(false)} className="btn btn-outline" disabled={submitting}>
                   Cancel
                 </button>
-                <button type="submit" className="btn btn-primary" style={{ background: '#6D28D9' }}>
-                  Create Receipt Order
+                <button type="submit" className="btn btn-primary" style={{ background: '#6D28D9' }} disabled={submitting}>
+                  {submitting ? <Loader2 size={16} className="animate-spin" /> : 'Create Receipt Order'}
                 </button>
               </div>
             </form>
@@ -371,7 +493,7 @@ export const ReceiptsView: React.FC<ReceiptsViewProps> = ({ onNavigate, openNewM
                 <div style={{ fontSize: 13, color: '#6D28D9', fontWeight: 700 }}>
                   RECEIPT #{selectedReceipt.reference}
                 </div>
-                <h3 style={{ fontSize: 18, marginTop: 2 }}>{selectedReceipt.supplier}</h3>
+                <h3 style={{ fontSize: 18, marginTop: 2 }}>{selectedReceipt.partnerName || 'Supplier'}</h3>
               </div>
               <button
                 onClick={() => setSelectedReceipt(null)}
@@ -386,13 +508,13 @@ export const ReceiptsView: React.FC<ReceiptsViewProps> = ({ onNavigate, openNewM
                 <div>
                   <div style={{ color: '#64748B' }}>Destination</div>
                   <div style={{ fontWeight: 600, color: '#0F172A', marginTop: 2 }}>
-                    {selectedReceipt.warehouseName} / {selectedReceipt.locationName}
+                    {selectedReceipt.destinationWarehouseName || 'Warehouse'} / {selectedReceipt.destinationLocationName || 'Location'}
                   </div>
                 </div>
                 <div>
                   <div style={{ color: '#64748B' }}>Status</div>
                   <div style={{ marginTop: 2 }}>
-                    <span className={`badge ${selectedReceipt.status === 'Done' ? 'badge-success' : 'badge-warning'}`}>
+                    <span className={`badge ${selectedReceipt.status === 'DONE' ? 'badge-success' : 'badge-warning'}`}>
                       {selectedReceipt.status}
                     </span>
                   </div>
@@ -403,14 +525,14 @@ export const ReceiptsView: React.FC<ReceiptsViewProps> = ({ onNavigate, openNewM
                 <div style={{ fontSize: 12, fontWeight: 700, color: '#64748B', textTransform: 'uppercase', marginBottom: 8 }}>
                   Material Items
                 </div>
-                {selectedReceipt.items.map((i) => (
-                  <div key={i.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                {selectedReceipt.lines.map((i) => (
+                  <div key={i.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
                     <div>
                       <div style={{ fontWeight: 600, color: '#0F172A', fontSize: 14 }}>{i.productName}</div>
                       <div style={{ fontSize: 12, color: '#64748B' }}>SKU: {i.sku}</div>
                     </div>
                     <div style={{ fontWeight: 700, color: '#10B981', fontSize: 15 }}>
-                      +{i.orderedQty} {i.uom}
+                      +{i.quantity} {i.unitOfMeasure}
                     </div>
                   </div>
                 ))}
@@ -426,13 +548,18 @@ export const ReceiptsView: React.FC<ReceiptsViewProps> = ({ onNavigate, openNewM
                 <button onClick={() => setSelectedReceipt(null)} className="btn btn-outline">
                   Close
                 </button>
-                {selectedReceipt.status !== 'Done' && (
+                {selectedReceipt.status !== 'DONE' && selectedReceipt.status !== 'CANCELED' && (
                   <button
-                    onClick={() => handleValidateReceipt(selectedReceipt.id)}
+                    onClick={() => handleValidateReceipt(selectedReceipt.documentId)}
                     className="btn btn-primary"
                     style={{ background: '#10B981' }}
+                    disabled={validatingId === selectedReceipt.documentId}
                   >
-                    <CheckCircle2 size={16} />
+                    {validatingId === selectedReceipt.documentId ? (
+                      <Loader2 size={16} className="animate-spin" />
+                    ) : (
+                      <CheckCircle2 size={16} />
+                    )}
                     Validate Receipt & Increase Stock
                   </button>
                 )}

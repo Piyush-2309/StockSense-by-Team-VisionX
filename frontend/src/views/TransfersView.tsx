@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   ArrowLeftRight,
   Plus,
@@ -7,12 +7,11 @@ import {
   Package,
   X,
   ArrowRight,
-  Building,
-  RotateCw,
+  Loader2,
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
-import { inventoryEngine } from '../services/inventoryEngine';
-import { InternalTransfer } from '../types';
+import { transferService, productService, warehouseService, locationService, stockService } from '../services/api';
+import { DocumentResponse, ProductResponse, WarehouseResponse, LocationResponse, StockResponse } from '../types';
 import { useToast } from '../components/Toast';
 import { RouteId } from '../components/Sidebar';
 
@@ -20,53 +19,108 @@ interface TransfersViewProps {
   onNavigate: (route: RouteId, targetId?: string) => void;
   openNewModalOnLoad?: boolean;
   preselectedProductId?: string;
+  refreshKey?: number;
+  onMutationSuccess?: () => void;
 }
 
 export const TransfersView: React.FC<TransfersViewProps> = ({
   onNavigate,
   openNewModalOnLoad,
   preselectedProductId,
+  refreshKey = 0,
+  onMutationSuccess,
 }) => {
   const { showToast } = useToast();
-  const transfers = inventoryEngine.getTransfers();
-  const products = inventoryEngine.getProducts();
-  const warehouses = inventoryEngine.getWarehouses();
-  const locations = inventoryEngine.getLocations();
+  const [transfers, setTransfers] = useState<DocumentResponse[]>([]);
+  const [products, setProducts] = useState<ProductResponse[]>([]);
+  const [warehouses, setWarehouses] = useState<WarehouseResponse[]>([]);
+  const [locations, setLocations] = useState<LocationResponse[]>([]);
+  const [stocks, setStocks] = useState<StockResponse[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
+  const [validatingId, setValidatingId] = useState<string | null>(null);
 
   const [search, setSearch] = useState('');
   const [isModalOpen, setIsModalOpen] = useState(openNewModalOnLoad || false);
-  const [selectedTransfer, setSelectedTransfer] = useState<InternalTransfer | null>(null);
+  const [selectedTransfer, setSelectedTransfer] = useState<DocumentResponse | null>(null);
 
   // Form State
   const [formData, setFormData] = useState({
-    sourceWarehouseId: 'wh-main',
-    sourceLocationId: 'loc-rack-a',
-    destWarehouseId: 'wh-prod',
-    destLocationId: 'loc-prod-p1',
-    productId: preselectedProductId || 'prod-steel-rod',
+    sourceWarehouseId: 0,
+    sourceLocationId: 0,
+    destWarehouseId: 0,
+    destLocationId: 0,
+    productId: preselectedProductId ? Number(preselectedProductId) : 0,
     quantity: 30,
     notes: '',
   });
 
+  const fetchData = async () => {
+    setLoading(true);
+    try {
+      const [transRes, prodRes, whRes, locRes, stockRes] = await Promise.all([
+        transferService.list({ size: 100 }),
+        productService.list({ size: 100 }),
+        warehouseService.list(),
+        locationService.list(),
+        stockService.list().catch(() => [] as StockResponse[]),
+      ]);
+      setTransfers(transRes.content || []);
+      setProducts(prodRes.content || []);
+      setWarehouses(whRes || []);
+      setLocations(locRes || []);
+      setStocks(stockRes || []);
+
+      const defProdId = preselectedProductId ? Number(preselectedProductId) : prodRes.content?.[0]?.id || 0;
+      const defSourceWh = whRes[0]?.id || 0;
+      const defDestWh = whRes.length > 1 ? whRes[1].id : whRes[0]?.id || 0;
+      const sourceLocs = locRes.filter((l) => l.warehouseId === defSourceWh);
+      const destLocs = locRes.filter((l) => l.warehouseId === defDestWh);
+
+      setFormData((prev) => ({
+        ...prev,
+        productId: prev.productId || defProdId,
+        sourceWarehouseId: prev.sourceWarehouseId || defSourceWh,
+        sourceLocationId: prev.sourceLocationId || sourceLocs[0]?.id || 0,
+        destWarehouseId: prev.destWarehouseId || defDestWh,
+        destLocationId: prev.destLocationId || destLocs[0]?.id || 0,
+      }));
+    } catch (err: any) {
+      console.error('Failed to load transfers:', err);
+      showToast('error', 'Load Error', err?.message || 'Failed to load transfers.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchData();
+  }, [refreshKey]);
+
+  useEffect(() => {
+    if (openNewModalOnLoad) {
+      setIsModalOpen(true);
+    }
+  }, [openNewModalOnLoad]);
+
   const selectedProduct = products.find((p) => p.id === formData.productId);
-  const sourceQuant = inventoryEngine.getQuants(
-    formData.productId,
-    formData.sourceWarehouseId,
-    formData.sourceLocationId
-  )[0];
-  const sourceAvailable = sourceQuant ? Math.max(0, sourceQuant.quantity - sourceQuant.reservedQuantity) : 0;
+  const matchingStock = stocks.find(
+    (s) => s.productId === formData.productId && s.locationId === formData.sourceLocationId
+  );
+  const sourceAvailable = matchingStock ? matchingStock.quantityFree : 0;
 
   const filteredTransfers = transfers.filter((t) => {
     if (search) {
       const q = search.toLowerCase();
-      if (!t.reference.toLowerCase().includes(q) && !t.destLocationName.toLowerCase().includes(q)) {
-        return false;
-      }
+      const refMatch = t.reference?.toLowerCase().includes(q);
+      const destMatch = t.destinationLocationName?.toLowerCase().includes(q);
+      const sourceMatch = t.sourceLocationName?.toLowerCase().includes(q);
+      if (!refMatch && !destMatch && !sourceMatch) return false;
     }
     return true;
   });
 
-  const handleExecuteTransfer = (e: React.FormEvent) => {
+  const handleExecuteTransfer = async (e: React.FormEvent) => {
     e.preventDefault();
     if (formData.sourceLocationId === formData.destLocationId) {
       showToast('error', 'Invalid Transfer', 'Source and destination locations cannot be identical.');
@@ -78,36 +132,58 @@ export const TransfersView: React.FC<TransfersViewProps> = ({
       return;
     }
 
-    if (formData.quantity > sourceAvailable) {
-      showToast(
-        'error',
-        'Insufficient Stock',
-        `Cannot transfer ${formData.quantity} ${selectedProduct?.uom}. Only ${sourceAvailable} available in source location.`
-      );
-      return;
-    }
+    setSubmitting(true);
+    try {
+      // 1. Create transfer draft
+      const created = await transferService.create({
+        sourceLocationId: formData.sourceLocationId,
+        destinationLocationId: formData.destLocationId,
+        items: [
+          {
+            productId: formData.productId,
+            quantity: Number(formData.quantity) || 1,
+          },
+        ],
+        notes: formData.notes.trim() || undefined,
+      });
 
-    const res = inventoryEngine.createAndExecuteTransfer({
-      sourceWarehouseId: formData.sourceWarehouseId,
-      sourceLocationId: formData.sourceLocationId,
-      destWarehouseId: formData.destWarehouseId,
-      destLocationId: formData.destLocationId,
-      productId: formData.productId,
-      quantity: Number(formData.quantity) || 1,
-      notes: formData.notes,
-    });
+      // 2. Validate transfer immediately so stock is moved atomically in DB
+      const validated = await transferService.validate(created.documentId);
 
-    if (res.success && res.transfer) {
       confetti({
-        particleCount: 65,
+        particleCount: 60,
         spread: 60,
         origin: { y: 0.6 },
       });
-      showToast('success', 'Transfer Completed', res.message);
+      showToast('success', 'Transfer Completed', `Transferred ${formData.quantity} units to ${validated.destinationLocationName}.`);
       setIsModalOpen(false);
-      setSelectedTransfer(res.transfer);
-    } else {
-      showToast('error', 'Transfer Failed', res.error);
+      setSelectedTransfer(validated);
+      fetchData();
+      if (onMutationSuccess) onMutationSuccess();
+    } catch (err: any) {
+      showToast('error', 'Transfer Failed', err?.message || 'Could not execute internal transfer');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleValidateTransfer = async (documentId: string) => {
+    setValidatingId(documentId);
+    try {
+      const updated = await transferService.validate(documentId);
+      confetti({
+        particleCount: 60,
+        spread: 60,
+        origin: { y: 0.6 },
+      });
+      showToast('success', 'Transfer Validated', `Transfer ${updated.reference} validated.`);
+      setSelectedTransfer(null);
+      fetchData();
+      if (onMutationSuccess) onMutationSuccess();
+    } catch (err: any) {
+      showToast('error', 'Validation Failed', err?.message || 'Could not validate transfer');
+    } finally {
+      setValidatingId(null);
     }
   };
 
@@ -118,7 +194,7 @@ export const TransfersView: React.FC<TransfersViewProps> = ({
         <div>
           <h1 style={{ fontSize: 26, color: '#0F172A' }}>Internal Transfers</h1>
           <p style={{ color: '#64748B', fontSize: 14, marginTop: 4 }}>
-            Relocate stock across warehouse zones, assembly racks, and buffer bays.
+            Inter-warehouse stock relocations, bin movements, and storage reorganization.
           </p>
         </div>
         <button
@@ -131,110 +207,130 @@ export const TransfersView: React.FC<TransfersViewProps> = ({
         </button>
       </div>
 
-      {/* Visual Movement Flow Banner */}
+      {/* Filter Bar */}
       <div
         className="card"
         style={{
-          padding: '20px 24px',
-          background: 'linear-gradient(135deg, #FAF5FF 0%, #FFFFFF 100%)',
-          border: '1px solid #DDD6FE',
+          padding: '14px 18px',
           display: 'flex',
           alignItems: 'center',
-          justifyContent: 'space-between',
-          flexWrap: 'wrap',
-          gap: 16,
+          gap: 14,
         }}
       >
-        <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
-          <div
-            style={{
-              width: 44,
-              height: 44,
-              borderRadius: 12,
-              background: '#6D28D9',
-              color: '#FFFFFF',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-            }}
-          >
-            <ArrowLeftRight size={22} />
-          </div>
-          <div>
-            <div style={{ fontWeight: 700, fontSize: 15, color: '#4C1D95' }}>Double-Entry Location Relocation</div>
-            <div style={{ fontSize: 12.5, color: '#6D28D9' }}>
-              Transfers decrease source quant & increase destination quant. Total product inventory remains unchanged.
-            </div>
-          </div>
+        <div style={{ flex: 1, minWidth: 240, position: 'relative' }}>
+          <Search size={16} color="#94A3B8" style={{ position: 'absolute', left: 12, top: 11 }} />
+          <input
+            type="text"
+            placeholder="Search by transfer ref or location..."
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            className="input-field"
+            style={{ paddingLeft: 36 }}
+          />
         </div>
-        <button
-          onClick={() => setIsModalOpen(true)}
-          className="btn btn-sm btn-outline-purple"
-          style={{ padding: '8px 14px' }}
-        >
-          Move Inventory →
-        </button>
       </div>
 
       {/* Transfers Table */}
       <div className="table-container">
-        <table className="enterprise-table">
-          <thead>
-            <tr>
-              <th>Reference</th>
-              <th>Source Location</th>
-              <th>Destination Location</th>
-              <th>Product</th>
-              <th>Transferred Qty</th>
-              <th>Status</th>
-              <th>Timestamp</th>
-              <th style={{ textAlign: 'right' }}>Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {filteredTransfers.map((t) => {
-              const item = t.items[0];
-              return (
-                <tr key={t.id}>
-                  <td style={{ fontWeight: 700, color: '#6D28D9', cursor: 'pointer' }} onClick={() => setSelectedTransfer(t)}>
-                    {t.reference}
-                  </td>
-                  <td style={{ fontWeight: 500, color: '#334155' }}>{t.sourceLocationName}</td>
-                  <td style={{ fontWeight: 600, color: '#0F172A' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                      <ArrowRight size={14} color="#6D28D9" />
-                      <span>{t.destLocationName}</span>
+        {loading && (
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '48px 0', gap: 12 }}>
+            <Loader2 size={28} color="#6D28D9" className="animate-spin" />
+            <span style={{ color: '#64748B', fontSize: 14 }}>Loading internal movements…</span>
+          </div>
+        )}
+
+        {!loading && (
+          <table className="enterprise-table">
+            <thead>
+              <tr>
+                <th>Reference</th>
+                <th>Source Location</th>
+                <th>Destination Location</th>
+                <th>Product & Qty</th>
+                <th>Status</th>
+                <th>Date</th>
+                <th style={{ textAlign: 'right' }}>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filteredTransfers.length === 0 ? (
+                <tr>
+                  <td colSpan={7} style={{ textAlign: 'center', padding: '48px 20px', color: '#64748B' }}>
+                    <Package size={40} color="#CBD5E1" style={{ margin: '0 auto 10px' }} />
+                    <div style={{ fontWeight: 600, fontSize: 14 }}>No internal transfers found</div>
+                    <div style={{ fontSize: 12.5, color: '#94A3B8', marginTop: 4 }}>
+                      Create a new transfer to move stock between storage racks.
                     </div>
-                  </td>
-                  <td>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                      <Package size={14} color="#64748B" />
-                      <span>{item?.productName}</span>
-                    </div>
-                  </td>
-                  <td style={{ fontWeight: 700, color: '#6D28D9' }}>
-                    {item?.quantity} {item?.uom}
-                  </td>
-                  <td>
-                    <span className="badge badge-success">
-                      <span className="badge-dot" />
-                      {t.status}
-                    </span>
-                  </td>
-                  <td style={{ fontSize: 12, color: '#64748B' }}>{t.date}</td>
-                  <td style={{ textAlign: 'right' }}>
-                    <button
-                      onClick={() => setSelectedTransfer(t)}
-                      className="btn btn-sm btn-outline"
-                    >
-                      View
-                    </button>
                   </td>
                 </tr>
-              );
-            })}
-          </tbody>
-        </table>
+              ) : (
+                filteredTransfers.map((t) => {
+                  const isDone = t.status === 'DONE';
+                  const item = t.lines[0];
+
+                  return (
+                    <tr key={t.documentId}>
+                      <td style={{ fontWeight: 600, color: '#6D28D9' }}>{t.reference}</td>
+                      <td style={{ fontWeight: 500, color: '#334155' }}>
+                        {t.sourceWarehouseName || 'Warehouse'} / {t.sourceLocationName || 'Rack'}
+                      </td>
+                      <td style={{ fontWeight: 600, color: '#0F172A' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                          <ArrowRight size={14} color="#6D28D9" />
+                          <span>{t.destinationWarehouseName || 'Warehouse'} / {t.destinationLocationName || 'Rack'}</span>
+                        </div>
+                      </td>
+                      <td>
+                        {item ? (
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                            <Package size={14} color="#64748B" />
+                            <span style={{ fontWeight: 600 }}>{item.quantity} {item.unitOfMeasure}</span>
+                            <span style={{ color: '#64748B' }}>{item.productName}</span>
+                          </div>
+                        ) : (
+                          'No items'
+                        )}
+                      </td>
+                      <td>
+                        <span className={`badge ${isDone ? 'badge-success' : 'badge-warning'}`}>
+                          <span className="badge-dot" />
+                          {t.status}
+                        </span>
+                      </td>
+                      <td style={{ fontSize: 12, color: '#64748B' }}>
+                        {t.createdAt ? new Date(t.createdAt).toLocaleDateString() : 'Today'}
+                      </td>
+                      <td style={{ textAlign: 'right' }}>
+                        {!isDone && t.status !== 'CANCELED' ? (
+                          <button
+                            onClick={() => handleValidateTransfer(t.documentId)}
+                            className="btn btn-sm btn-primary"
+                            style={{ background: '#6D28D9' }}
+                            disabled={validatingId === t.documentId}
+                          >
+                            {validatingId === t.documentId ? (
+                              <Loader2 size={13} className="animate-spin" />
+                            ) : (
+                              <CheckCircle2 size={13} />
+                            )}
+                            Validate
+                          </button>
+                        ) : (
+                          <button
+                            onClick={() => setSelectedTransfer(t)}
+                            className="btn btn-sm btn-outline"
+                          >
+                            View
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })
+              )}
+            </tbody>
+          </table>
+        )}
       </div>
 
       {/* New Transfer Modal */}
@@ -281,12 +377,12 @@ export const TransfersView: React.FC<TransfersViewProps> = ({
                   <label className="input-label">Product to Move</label>
                   <select
                     value={formData.productId}
-                    onChange={(e) => setFormData({ ...formData, productId: e.target.value })}
+                    onChange={(e) => setFormData({ ...formData, productId: Number(e.target.value) })}
                     className="input-field"
                   >
                     {products.map((p) => (
                       <option key={p.id} value={p.id}>
-                        {p.name} ({p.sku}) — {p.totalStock} {p.uom} Total
+                        {p.name} ({p.sku}) — {p.totalStock} {p.unitOfMeasure} Total
                       </option>
                     ))}
                   </select>
@@ -315,7 +411,11 @@ export const TransfersView: React.FC<TransfersViewProps> = ({
                   </div>
                   <select
                     value={formData.sourceWarehouseId}
-                    onChange={(e) => setFormData({ ...formData, sourceWarehouseId: e.target.value })}
+                    onChange={(e) => {
+                      const whId = Number(e.target.value);
+                      const firstLoc = locations.find((l) => l.warehouseId === whId);
+                      setFormData({ ...formData, sourceWarehouseId: whId, sourceLocationId: firstLoc?.id || 0 });
+                    }}
                     className="input-field"
                     style={{ marginBottom: 6 }}
                   >
@@ -325,18 +425,17 @@ export const TransfersView: React.FC<TransfersViewProps> = ({
                   </select>
                   <select
                     value={formData.sourceLocationId}
-                    onChange={(e) => setFormData({ ...formData, sourceLocationId: e.target.value })}
+                    onChange={(e) => setFormData({ ...formData, sourceLocationId: Number(e.target.value) })}
                     className="input-field"
                   >
                     {locations
-                      .filter((l) => l.warehouseId === formData.sourceWarehouseId)
+                      .filter((l) => !formData.sourceWarehouseId || l.warehouseId === formData.sourceWarehouseId)
                       .map((l) => (
-                        <option key={l.id} value={l.id}>{l.name}</option>
+                        <option key={l.id} value={l.id}>{l.name} ({l.code})</option>
                       ))}
                   </select>
                 </div>
 
-                {/* Arrow */}
                 <div style={{ color: '#6D28D9' }}>
                   <ArrowRight size={22} />
                 </div>
@@ -348,7 +447,11 @@ export const TransfersView: React.FC<TransfersViewProps> = ({
                   </div>
                   <select
                     value={formData.destWarehouseId}
-                    onChange={(e) => setFormData({ ...formData, destWarehouseId: e.target.value })}
+                    onChange={(e) => {
+                      const whId = Number(e.target.value);
+                      const firstLoc = locations.find((l) => l.warehouseId === whId);
+                      setFormData({ ...formData, destWarehouseId: whId, destLocationId: firstLoc?.id || 0 });
+                    }}
                     className="input-field"
                     style={{ marginBottom: 6 }}
                   >
@@ -358,13 +461,13 @@ export const TransfersView: React.FC<TransfersViewProps> = ({
                   </select>
                   <select
                     value={formData.destLocationId}
-                    onChange={(e) => setFormData({ ...formData, destLocationId: e.target.value })}
+                    onChange={(e) => setFormData({ ...formData, destLocationId: Number(e.target.value) })}
                     className="input-field"
                   >
                     {locations
-                      .filter((l) => l.warehouseId === formData.destWarehouseId)
+                      .filter((l) => !formData.destWarehouseId || l.warehouseId === formData.destWarehouseId)
                       .map((l) => (
-                        <option key={l.id} value={l.id}>{l.name}</option>
+                        <option key={l.id} value={l.id}>{l.name} ({l.code})</option>
                       ))}
                   </select>
                 </div>
@@ -384,7 +487,7 @@ export const TransfersView: React.FC<TransfersViewProps> = ({
               >
                 <span style={{ color: '#475569' }}>Available in selected source location:</span>
                 <strong style={{ color: '#0F172A', fontSize: 14 }}>
-                  {sourceAvailable} {selectedProduct?.uom}
+                  {sourceAvailable} {selectedProduct?.unitOfMeasure}
                 </strong>
               </div>
 
@@ -400,16 +503,11 @@ export const TransfersView: React.FC<TransfersViewProps> = ({
               </div>
 
               <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12, marginTop: 8 }}>
-                <button type="button" onClick={() => setIsModalOpen(false)} className="btn btn-outline">
+                <button type="button" onClick={() => setIsModalOpen(false)} className="btn btn-outline" disabled={submitting}>
                   Cancel
                 </button>
-                <button
-                  type="submit"
-                  disabled={formData.quantity > sourceAvailable || formData.sourceLocationId === formData.destLocationId}
-                  className="btn btn-primary"
-                  style={{ background: '#6D28D9' }}
-                >
-                  Execute Transfer
+                <button type="submit" className="btn btn-primary" style={{ background: '#6D28D9' }} disabled={submitting}>
+                  {submitting ? <Loader2 size={16} className="animate-spin" /> : 'Execute Transfer'}
                 </button>
               </div>
             </form>
@@ -417,7 +515,7 @@ export const TransfersView: React.FC<TransfersViewProps> = ({
         </div>
       )}
 
-      {/* Transfer Detail View */}
+      {/* Transfer Detail Dialog */}
       {selectedTransfer && (
         <div className="modal-overlay" onClick={() => setSelectedTransfer(null)}>
           <div className="modal-content" style={{ maxWidth: 520 }} onClick={(e) => e.stopPropagation()}>
@@ -434,7 +532,7 @@ export const TransfersView: React.FC<TransfersViewProps> = ({
                 <div style={{ fontSize: 13, color: '#6D28D9', fontWeight: 700 }}>
                   TRANSFER #{selectedTransfer.reference}
                 </div>
-                <h3 style={{ fontSize: 18, marginTop: 2 }}>Stock Relocation Verified</h3>
+                <h3 style={{ fontSize: 18, marginTop: 2 }}>Internal Stock Movement</h3>
               </div>
               <button
                 onClick={() => setSelectedTransfer(null)}
@@ -445,36 +543,36 @@ export const TransfersView: React.FC<TransfersViewProps> = ({
             </div>
 
             <div style={{ padding: '20px 24px', display: 'flex', flexDirection: 'column', gap: 16 }}>
-              <div
-                style={{
-                  padding: '16px',
-                  borderRadius: 10,
-                  background: '#FAF5FF',
-                  border: '1px solid #DDD6FE',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'space-between',
-                }}
-              >
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, fontSize: 13 }}>
                 <div>
-                  <div style={{ fontSize: 11, color: '#64748B', fontWeight: 700 }}>SOURCE</div>
-                  <div style={{ fontWeight: 700, color: '#0F172A', marginTop: 2 }}>
-                    {selectedTransfer.sourceLocationName}
+                  <div style={{ color: '#64748B' }}>Source</div>
+                  <div style={{ fontWeight: 600, color: '#0F172A', marginTop: 2 }}>
+                    {selectedTransfer.sourceWarehouseName} / {selectedTransfer.sourceLocationName}
                   </div>
                 </div>
-                <div style={{ textAlign: 'center', color: '#6D28D9', fontWeight: 800 }}>
-                  <div>→ {selectedTransfer.items[0]?.quantity} {selectedTransfer.items[0]?.uom} →</div>
-                </div>
-                <div style={{ textAlign: 'right' }}>
-                  <div style={{ fontSize: 11, color: '#64748B', fontWeight: 700 }}>DESTINATION</div>
-                  <div style={{ fontWeight: 700, color: '#0F172A', marginTop: 2 }}>
-                    {selectedTransfer.destLocationName}
+                <div>
+                  <div style={{ color: '#64748B' }}>Destination</div>
+                  <div style={{ fontWeight: 600, color: '#0F172A', marginTop: 2 }}>
+                    {selectedTransfer.destinationWarehouseName} / {selectedTransfer.destinationLocationName}
                   </div>
                 </div>
               </div>
 
-              <div style={{ fontSize: 13, color: '#475569' }}>
-                Product: <strong>{selectedTransfer.items[0]?.productName}</strong> ({selectedTransfer.items[0]?.sku})
+              <div style={{ background: '#F8FAFC', borderRadius: 8, padding: '14px', border: '1px solid #E2E8F0' }}>
+                <div style={{ fontSize: 12, fontWeight: 700, color: '#64748B', textTransform: 'uppercase', marginBottom: 8 }}>
+                  Moved Items
+                </div>
+                {selectedTransfer.lines.map((i) => (
+                  <div key={i.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <div>
+                      <div style={{ fontWeight: 600, color: '#0F172A', fontSize: 14 }}>{i.productName}</div>
+                      <div style={{ fontSize: 12, color: '#64748B' }}>SKU: {i.sku}</div>
+                    </div>
+                    <div style={{ fontWeight: 700, color: '#6D28D9', fontSize: 15 }}>
+                      {i.quantity} {i.unitOfMeasure}
+                    </div>
+                  </div>
+                ))}
               </div>
 
               {selectedTransfer.notes && (
@@ -483,19 +581,9 @@ export const TransfersView: React.FC<TransfersViewProps> = ({
                 </div>
               )}
 
-              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12, marginTop: 8 }}>
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12, marginTop: 10 }}>
                 <button onClick={() => setSelectedTransfer(null)} className="btn btn-outline">
                   Close
-                </button>
-                <button
-                  onClick={() => {
-                    setSelectedTransfer(null);
-                    onNavigate('ledger');
-                  }}
-                  className="btn btn-primary"
-                  style={{ background: '#6D28D9' }}
-                >
-                  Inspect in Ledger
                 </button>
               </div>
             </div>

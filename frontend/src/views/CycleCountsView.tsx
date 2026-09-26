@@ -1,32 +1,74 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
-  RefreshCw,
-  Plus,
-  Search,
   CheckCircle2,
   Package,
   X,
-  AlertTriangle,
-  MapPin,
-  ClipboardList,
+  Loader2,
+  RefreshCw,
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
-import { inventoryEngine } from '../services/inventoryEngine';
-import { CycleCount } from '../types';
+import { stockService, adjustmentService } from '../services/api';
+import { StockResponse } from '../types';
 import { useToast } from '../components/Toast';
 import { RouteId } from '../components/Sidebar';
 
 interface CycleCountsViewProps {
   onNavigate: (route: RouteId, targetId?: string) => void;
+  refreshKey?: number;
 }
 
-export const CycleCountsView: React.FC<CycleCountsViewProps> = ({ onNavigate }) => {
-  const { showToast } = useToast();
-  const counts = inventoryEngine.getCycleCounts();
-  const [selectedItem, setSelectedItem] = useState<CycleCount | null>(null);
-  const [countedQty, setCountedQty] = useState<number>(0);
+interface CycleItem {
+  id: number;
+  stockId: number;
+  productId: number;
+  locationId: number;
+  locationName: string;
+  productName: string;
+  sku: string;
+  uom: string;
+  systemQuantity: number;
+  countedQuantity?: number;
+  variance?: number;
+  status: 'Pending' | 'Counted' | 'Reconciled';
+}
 
-  const handleOpenCountModal = (item: CycleCount) => {
+export const CycleCountsView: React.FC<CycleCountsViewProps> = ({ onNavigate, refreshKey = 0 }) => {
+  const { showToast } = useToast();
+  const [items, setItems] = useState<CycleItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [selectedItem, setSelectedItem] = useState<CycleItem | null>(null);
+  const [countedQty, setCountedQty] = useState<number>(0);
+  const [submitting, setSubmitting] = useState(false);
+
+  const fetchData = async () => {
+    setLoading(true);
+    try {
+      const stocks = await stockService.list();
+      const cycleItems: CycleItem[] = (stocks || []).map((s, idx) => ({
+        id: idx + 1,
+        stockId: s.id,
+        productId: s.productId,
+        locationId: s.locationId,
+        locationName: s.locationName || s.locationCode,
+        productName: s.productName,
+        sku: s.sku,
+        uom: s.unitOfMeasure,
+        systemQuantity: s.quantityOnHand,
+        status: 'Pending',
+      }));
+      setItems(cycleItems);
+    } catch (err) {
+      console.error('Failed to load cycle count items:', err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchData();
+  }, [refreshKey]);
+
+  const handleOpenCountModal = (item: CycleItem) => {
     setSelectedItem(item);
     setCountedQty(item.countedQuantity !== undefined ? item.countedQuantity : item.systemQuantity);
   };
@@ -35,19 +77,58 @@ export const CycleCountsView: React.FC<CycleCountsViewProps> = ({ onNavigate }) 
     e.preventDefault();
     if (!selectedItem) return;
 
-    inventoryEngine.updateCycleCount(selectedItem.id, countedQty);
+    setItems((prev) =>
+      prev.map((i) =>
+        i.stockId === selectedItem.stockId
+          ? {
+              ...i,
+              countedQuantity: countedQty,
+              variance: countedQty - i.systemQuantity,
+              status: 'Counted',
+            }
+          : i
+      )
+    );
+
     showToast('info', 'Count Recorded', `Recorded physical count of ${countedQty} ${selectedItem.uom} for ${selectedItem.productName}.`);
     setSelectedItem(null);
   };
 
-  const handleCompleteAndAdjust = (item: CycleCount) => {
-    inventoryEngine.completeCycleCount(item.id);
-    confetti({
-      particleCount: 50,
-      spread: 60,
-      origin: { y: 0.6 },
-    });
-    showToast('success', 'Cycle Count Completed', `Inventory reconciled and audited for ${item.productName}.`);
+  const handleCompleteAndAdjust = async (item: CycleItem) => {
+    if (item.countedQuantity === undefined) return;
+
+    setSubmitting(true);
+    try {
+      const created = await adjustmentService.create({
+        locationId: item.locationId,
+        reason: 'Cycle Count Audit',
+        notes: `Cycle count physical inventory audit: reconciled ${item.productName}`,
+        items: [
+          {
+            productId: item.productId,
+            physicalQuantity: item.countedQuantity,
+          },
+        ],
+      });
+
+      await adjustmentService.validate(created.documentId);
+
+      confetti({
+        particleCount: 50,
+        spread: 60,
+        origin: { y: 0.6 },
+      });
+
+      setItems((prev) =>
+        prev.map((i) => (i.stockId === item.stockId ? { ...i, status: 'Reconciled' } : i))
+      );
+
+      showToast('success', 'Cycle Count Reconciled', `Inventory reconciled and audited for ${item.productName}.`);
+    } catch (err: any) {
+      showToast('error', 'Reconciliation Failed', err?.message || 'Could not reconcile cycle count');
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   return (
@@ -64,94 +145,105 @@ export const CycleCountsView: React.FC<CycleCountsViewProps> = ({ onNavigate }) 
 
       {/* Cycle Counts Table */}
       <div className="table-container">
-        <table className="enterprise-table">
-          <thead>
-            <tr>
-              <th>ID</th>
-              <th>Location</th>
-              <th>Product</th>
-              <th>System Qty</th>
-              <th>Counted Qty</th>
-              <th>Variance</th>
-              <th>Assigned Operator</th>
-              <th>Audit Schedule</th>
-              <th>Status</th>
-              <th style={{ textAlign: 'right' }}>Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {counts.map((c) => {
-              const isCompleted = c.status === 'Completed';
-              return (
-                <tr key={c.id}>
-                  <td style={{ fontWeight: 700, color: '#6D28D9' }}>{c.id}</td>
-                  <td style={{ fontWeight: 600, color: '#0F172A' }}>{c.locationName}</td>
-                  <td>
-                    <div style={{ fontWeight: 600, color: '#0F172A' }}>{c.productName}</div>
-                    <div style={{ fontSize: 11.5, color: '#64748B' }}>{c.sku}</div>
-                  </td>
-                  <td>{c.systemQuantity} {c.uom}</td>
-                  <td style={{ fontWeight: 600, color: c.countedQuantity !== undefined ? '#6D28D9' : '#94A3B8' }}>
-                    {c.countedQuantity !== undefined ? `${c.countedQuantity} ${c.uom}` : 'Not counted'}
-                  </td>
-                  <td>
-                    {c.variance !== undefined ? (
-                      <span
-                        className={`badge ${c.variance === 0 ? 'badge-neutral' : c.variance < 0 ? 'badge-danger' : 'badge-success'}`}
-                      >
-                        {c.variance > 0 ? `+${c.variance}` : c.variance} {c.uom}
-                      </span>
-                    ) : (
-                      <span style={{ color: '#94A3B8', fontSize: 12 }}>—</span>
-                    )}
-                  </td>
-                  <td style={{ color: '#334155' }}>{c.assignedTo}</td>
-                  <td style={{ fontSize: 12, color: '#64748B' }}>Next: {c.nextCountDate}</td>
-                  <td>
-                    <span
-                      className={`badge ${
-                        isCompleted
-                          ? 'badge-success'
-                          : c.status === 'Review'
-                          ? 'badge-purple'
-                          : c.status === 'Counting'
-                          ? 'badge-warning'
-                          : 'badge-neutral'
-                      }`}
-                    >
-                      <span className="badge-dot" />
-                      {c.status}
-                    </span>
-                  </td>
-                  <td style={{ textAlign: 'right' }}>
-                    {!isCompleted ? (
-                      <div style={{ display: 'inline-flex', gap: 6 }}>
-                        <button
-                          onClick={() => handleOpenCountModal(c)}
-                          className="btn btn-sm btn-outline"
-                        >
-                          Record Count
-                        </button>
-                        {c.countedQuantity !== undefined && (
-                          <button
-                            onClick={() => handleCompleteAndAdjust(c)}
-                            className="btn btn-sm btn-primary"
-                            style={{ background: '#10B981' }}
-                          >
-                            <CheckCircle2 size={13} />
-                            Reconcile
-                          </button>
-                        )}
-                      </div>
-                    ) : (
-                      <span style={{ fontSize: 12, color: '#10B981', fontWeight: 600 }}>Audited ✓</span>
-                    )}
+        {loading && (
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '48px 0', gap: 12 }}>
+            <Loader2 size={28} color="#6D28D9" className="animate-spin" />
+            <span style={{ color: '#64748B', fontSize: 14 }}>Loading cycle audit schedules…</span>
+          </div>
+        )}
+
+        {!loading && (
+          <table className="enterprise-table">
+            <thead>
+              <tr>
+                <th>Bin / Location</th>
+                <th>Product</th>
+                <th>System Qty</th>
+                <th>Counted Qty</th>
+                <th>Variance</th>
+                <th>Status</th>
+                <th style={{ textAlign: 'right' }}>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {items.length === 0 ? (
+                <tr>
+                  <td colSpan={7} style={{ textAlign: 'center', padding: '48px 20px', color: '#64748B' }}>
+                    <Package size={40} color="#CBD5E1" style={{ margin: '0 auto 10px' }} />
+                    <div style={{ fontWeight: 600, fontSize: 14 }}>No inventory quants found for auditing</div>
                   </td>
                 </tr>
-              );
-            })}
-          </tbody>
-        </table>
+              ) : (
+                items.map((c) => {
+                  const isCompleted = c.status === 'Reconciled';
+                  return (
+                    <tr key={c.stockId}>
+                      <td style={{ fontWeight: 600, color: '#0F172A' }}>{c.locationName}</td>
+                      <td>
+                        <div style={{ fontWeight: 600, color: '#0F172A' }}>{c.productName}</div>
+                        <div style={{ fontSize: 11.5, color: '#64748B' }}>{c.sku}</div>
+                      </td>
+                      <td>{c.systemQuantity} {c.uom}</td>
+                      <td style={{ fontWeight: 600, color: c.countedQuantity !== undefined ? '#6D28D9' : '#94A3B8' }}>
+                        {c.countedQuantity !== undefined ? `${c.countedQuantity} ${c.uom}` : 'Not counted'}
+                      </td>
+                      <td>
+                        {c.variance !== undefined ? (
+                          <span
+                            className={`badge ${c.variance === 0 ? 'badge-neutral' : c.variance < 0 ? 'badge-danger' : 'badge-success'}`}
+                          >
+                            {c.variance > 0 ? `+${c.variance}` : c.variance} {c.uom}
+                          </span>
+                        ) : (
+                          <span style={{ color: '#94A3B8', fontSize: 12 }}>—</span>
+                        )}
+                      </td>
+                      <td>
+                        <span
+                          className={`badge ${
+                            isCompleted
+                              ? 'badge-success'
+                              : c.status === 'Counted'
+                              ? 'badge-purple'
+                              : 'badge-neutral'
+                          }`}
+                        >
+                          <span className="badge-dot" />
+                          {c.status}
+                        </span>
+                      </td>
+                      <td style={{ textAlign: 'right' }}>
+                        {!isCompleted ? (
+                          <div style={{ display: 'inline-flex', gap: 6 }}>
+                            <button
+                              onClick={() => handleOpenCountModal(c)}
+                              className="btn btn-sm btn-outline"
+                            >
+                              Record Count
+                            </button>
+                            {c.countedQuantity !== undefined && (
+                              <button
+                                onClick={() => handleCompleteAndAdjust(c)}
+                                className="btn btn-sm btn-primary"
+                                style={{ background: '#10B981' }}
+                                disabled={submitting}
+                              >
+                                {submitting ? <Loader2 size={13} className="animate-spin" /> : <CheckCircle2 size={13} />}
+                                Reconcile
+                              </button>
+                            )}
+                          </div>
+                        ) : (
+                          <span style={{ fontSize: 12, color: '#10B981', fontWeight: 600 }}>Audited ✓</span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })
+              )}
+            </tbody>
+          </table>
+        )}
       </div>
 
       {/* Record Count Modal */}

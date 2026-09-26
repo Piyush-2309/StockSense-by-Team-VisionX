@@ -1,6 +1,7 @@
-import React, { useState } from 'react';
-import { X, Bot, Sparkles, Send, ArrowRight, CheckCircle2, ShieldAlert } from 'lucide-react';
-import { inventoryEngine } from '../services/inventoryEngine';
+import React, { useState, useEffect } from 'react';
+import { X, Bot, Send } from 'lucide-react';
+import { dashboardService, productService, stockService, ledgerService } from '../services/api';
+import { ProductResponse, StockResponse, DashboardData } from '../types';
 import { RouteId } from './Sidebar';
 
 interface StockSenseAiDrawerProps {
@@ -21,17 +22,39 @@ export const StockSenseAiDrawer: React.FC<StockSenseAiDrawerProps> = ({ isOpen, 
   const [messages, setMessages] = useState<Message[]>([
     {
       sender: 'assistant',
-      text: "Hello Tejas! I'm your StockSense AI Inventory Assistant. I inspect your actual real-time warehouse data, ledger movements, and stock levels to answer your questions accurately.",
+      text: "Hello! I'm your StockSense AI Inventory Assistant. I inspect your actual real-time warehouse data, ledger movements, and stock levels to answer your questions accurately.",
     },
   ]);
   const [input, setInput] = useState('');
+  const [dashboard, setDashboard] = useState<DashboardData | null>(null);
+  const [products, setProducts] = useState<ProductResponse[]>([]);
+  const [stocks, setStocks] = useState<StockResponse[]>([]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const fetchContext = async () => {
+      try {
+        const [dashRes, prodRes, stockRes] = await Promise.all([
+          dashboardService.getDashboard(),
+          productService.list({ size: 100 }),
+          stockService.list().catch(() => [] as StockResponse[]),
+        ]);
+        setDashboard(dashRes);
+        setProducts(prodRes.content || []);
+        setStocks(stockRes || []);
+      } catch (err) {
+        console.error('Failed to load AI context:', err);
+      }
+    };
+    fetchContext();
+  }, [isOpen]);
 
   if (!isOpen) return null;
 
   const quickQuestions = [
-    'Why is Steel Rod showing low stock?',
+    'Why is stock showing low?',
     'Which products need replenishment?',
-    'Where is product STL-001 located?',
+    'Where is stock located?',
     'Summarize current warehouse risk',
   ];
 
@@ -41,81 +64,72 @@ export const StockSenseAiDrawer: React.FC<StockSenseAiDrawerProps> = ({ isOpen, 
     const userMsg: Message = { sender: 'user', text: queryText };
     const q = queryText.toLowerCase();
 
-    // Query Real Data Authoritatively
     let botReply: Message = {
       sender: 'assistant',
       text: '',
     };
 
-    const state = inventoryEngine.getState();
-    const steelRod = state.products.find((p) => p.sku === 'STL-001');
+    const lowStockProduct = products.find(
+      (p) => p.stockStatus === 'LOW_STOCK' || p.stockStatus === 'OUT_OF_STOCK' || p.totalStock <= p.reorderLevel
+    );
 
-    if (q.includes('steel rod') && (q.includes('why') || q.includes('low') || q.includes('stock'))) {
-      const recentRodMovements = state.ledger.filter((m) => m.productId === steelRod?.id);
-      const quants = state.quants.filter((q) => q.productId === steelRod?.id);
+    if (q.includes('why') || q.includes('low') || (lowStockProduct && q.includes(lowStockProduct.name.toLowerCase()))) {
+      const prod = lowStockProduct || products[0];
+      const prodStocks = stocks.filter((s) => s.productId === prod?.id);
 
       botReply = {
         sender: 'assistant',
-        text: `Steel Rod (STL-001) is currently at **${steelRod?.totalStock ?? 0} kg**, which is below its configured reorder safety threshold of **${steelRod?.reorderLevel} kg** (Target: ${steelRod?.targetLevel} kg).`,
-        dataPoints: [
-          { label: 'Current On-Hand', value: `${steelRod?.totalStock ?? 0} kg` },
-          { label: 'Reorder Point', value: `${steelRod?.reorderLevel} kg` },
-          { label: 'Main Wh (Rack A)', value: `${quants.find((q) => q.locationId === 'loc-rack-a')?.quantity || 0} kg` },
-          { label: 'Production (P1)', value: `${quants.find((q) => q.locationId === 'loc-prod-p1')?.quantity || 0} kg` },
-          { label: 'Recent Movements', value: `${recentRodMovements.length} audit entries` },
-        ],
+        text: prod
+          ? `${prod.name} (${prod.sku}) is currently at **${prod.totalStock} ${prod.unitOfMeasure}**, which is at or below its configured safety threshold of **${prod.reorderLevel} ${prod.unitOfMeasure}**.`
+          : 'All inventory products are currently above their safety thresholds.',
+        dataPoints: prod
+          ? [
+              { label: 'Current On-Hand', value: `${prod.totalStock} ${prod.unitOfMeasure}` },
+              { label: 'Reorder Point', value: `${prod.reorderLevel} ${prod.unitOfMeasure}` },
+              { label: 'Locations Count', value: `${prodStocks.length} storage locations` },
+              { label: 'Status', value: prod.stockStatus },
+            ]
+          : [],
         actionRoute: 'reorder',
         actionLabel: 'Create Replenishment Order →',
       };
-    } else if (q.includes('replenish') || q.includes('reorder') || q.includes('low') || q.includes('out of stock')) {
-      const atRiskProducts = state.products.filter(
-        (p) => p.totalStock <= p.reorderLevel || p.status === 'Out of Stock'
-      );
+    } else if (q.includes('replenish') || q.includes('reorder') || q.includes('out of stock')) {
+      const atRisk = products.filter((p) => p.totalStock <= p.reorderLevel);
 
       botReply = {
         sender: 'assistant',
-        text: `Based on your live stock rules, **${atRiskProducts.length} products** currently require replenishment:`,
-        dataPoints: atRiskProducts.map((p) => ({
+        text: `Based on your live stock rules, **${atRisk.length} products** currently require replenishment:`,
+        dataPoints: atRisk.slice(0, 5).map((p) => ({
           label: `${p.name} (${p.sku})`,
-          value: `${p.totalStock} / ${p.reorderLevel} ${p.uom} [${p.status}]`,
+          value: `${p.totalStock} / ${p.reorderLevel} ${p.unitOfMeasure}`,
         })),
         actionRoute: 'risk',
         actionLabel: 'Go to Risk Center →',
       };
-    } else if (q.includes('where') || q.includes('stl-001') || q.includes('location')) {
-      const quants = state.quants.filter((q) => q.productId === steelRod?.id && q.quantity > 0);
+    } else if (q.includes('where') || q.includes('location')) {
       botReply = {
         sender: 'assistant',
-        text: `Steel Rod (STL-001) is currently stored in **${quants.length} warehouse locations**:`,
-        dataPoints: quants.map((q) => {
-          const loc = state.locations.find((l) => l.id === q.locationId);
-          return {
-            label: `${loc?.warehouseName || 'Warehouse'} / ${loc?.name || 'Rack'}`,
-            value: `${q.quantity} kg (Reserved: ${q.reservedQuantity} kg)`,
-          };
-        }),
+        text: `Physical inventory is distributed across **${stocks.length} storage records**. You can view complete hierarchical locations in Stock by Location:`,
+        dataPoints: stocks.slice(0, 4).map((s) => ({
+          label: `${s.warehouseName} / ${s.locationName || s.locationCode}`,
+          value: `${s.quantityOnHand} ${s.unitOfMeasure} (${s.productName})`,
+        })),
         actionRoute: 'stock-location',
         actionLabel: 'View Stock By Location →',
       };
-    } else if (q.includes('risk') || q.includes('health') || q.includes('summarize')) {
-      const stats = inventoryEngine.getDashboardStats();
+    } else {
+      const totalUnits = stocks.reduce((acc, s) => acc + s.quantityOnHand, 0);
       botReply = {
         sender: 'assistant',
-        text: `Warehouse Risk Summary: You have **${stats.outOfStockCount} Out-of-Stock items** and **${stats.lowStockCount} Low-Stock items** requiring immediate attention. Total active units in system: **${stats.totalStockUnits.toLocaleString()} units**.`,
+        text: `Warehouse State Summary: You have **${dashboard?.outOfStockCount ?? 0} Out-of-Stock items** and **${dashboard?.lowStockCount ?? 0} Low-Stock items**. Total physical units in system: **${totalUnits.toLocaleString()} units** across ${products.length} catalog items.`,
         dataPoints: [
-          { label: 'Out of Stock', value: `${stats.outOfStockCount} items` },
-          { label: 'Low Stock', value: `${stats.lowStockCount} items` },
-          { label: 'Pending Inbound', value: `${stats.pendingReceiptsCount} receipts` },
-          { label: 'Pending Outbound', value: `${stats.pendingDeliveriesCount} deliveries` },
+          { label: 'Total Products', value: `${products.length} SKUs` },
+          { label: 'Low Stock', value: `${dashboard?.lowStockCount ?? 0} items` },
+          { label: 'Pending Inbound', value: `${dashboard?.pendingReceipts ?? 0} receipts` },
+          { label: 'Pending Outbound', value: `${dashboard?.pendingDeliveries ?? 0} deliveries` },
         ],
         actionRoute: 'risk',
         actionLabel: 'Open Inventory Risk Center →',
-      };
-    } else {
-      const stats = inventoryEngine.getDashboardStats();
-      botReply = {
-        sender: 'assistant',
-        text: `I analyzed your inventory state: There are currently ${state.products.length} products tracked, ${stats.totalStockUnits.toLocaleString()} units in stock across 3 warehouses, and ${state.ledger.length} verified ledger operations. How else can I assist with your supply chain?`,
       };
     }
 
@@ -291,14 +305,6 @@ export const StockSenseAiDrawer: React.FC<StockSenseAiDrawerProps> = ({ isOpen, 
                   color: '#475569',
                   cursor: 'pointer',
                   textAlign: 'left',
-                }}
-                onMouseEnter={(e) => {
-                  e.currentTarget.style.background = '#EDE9FE';
-                  e.currentTarget.style.color = '#6D28D9';
-                }}
-                onMouseLeave={(e) => {
-                  e.currentTarget.style.background = '#F1F5F9';
-                  e.currentTarget.style.color = '#475569';
                 }}
               >
                 {q}

@@ -11,10 +11,10 @@ import {
   ShieldCheck,
   LogOut,
 } from 'lucide-react';
-import { Warehouse, User } from '../types';
+import { WarehouseResponse, User } from '../types';
 
 interface TopbarProps {
-  warehouses: Warehouse[];
+  warehouses: WarehouseResponse[];
   selectedWarehouse: string;
   onSelectWarehouse: (warehouseId: string) => void;
   user: User;
@@ -25,6 +25,7 @@ interface TopbarProps {
   onOpenGoldenDemo: () => void;
   onResetData: () => void;
   onNavigate: (route: any) => void;
+  onLogout?: () => void;
 }
 
 export const Topbar: React.FC<TopbarProps> = ({
@@ -39,6 +40,7 @@ export const Topbar: React.FC<TopbarProps> = ({
   onOpenGoldenDemo,
   onResetData,
   onNavigate,
+  onLogout,
 }) => {
   const [showProfileMenu, setShowProfileMenu] = useState(false);
   const [showWarehouseMenu, setShowWarehouseMenu] = useState(false);
@@ -46,7 +48,7 @@ export const Topbar: React.FC<TopbarProps> = ({
   const currentWarehouseName =
     selectedWarehouse === 'all'
       ? 'All Warehouses'
-      : warehouses.find((w) => w.id === selectedWarehouse)?.name || 'Main Warehouse';
+      : warehouses.find((w) => String(w.id) === selectedWarehouse)?.name || 'Main Warehouse';
 
   return (
     <header
@@ -241,16 +243,16 @@ export const Topbar: React.FC<TopbarProps> = ({
                 <div
                   key={w.id}
                   onClick={() => {
-                    onSelectWarehouse(w.id);
+                    onSelectWarehouse(String(w.id));
                     setShowWarehouseMenu(false);
                   }}
                   style={{
                     padding: '8px 12px',
                     borderRadius: 6,
                     fontSize: 13,
-                    fontWeight: selectedWarehouse === w.id ? 600 : 500,
-                    color: selectedWarehouse === w.id ? '#6D28D9' : '#334155',
-                    background: selectedWarehouse === w.id ? '#F5F3FF' : 'transparent',
+                    fontWeight: selectedWarehouse === String(w.id) ? 600 : 500,
+                    color: selectedWarehouse === String(w.id) ? '#6D28D9' : '#334155',
+                    background: selectedWarehouse === String(w.id) ? '#F5F3FF' : 'transparent',
                     cursor: 'pointer',
                   }}
                 >
@@ -336,7 +338,7 @@ export const Topbar: React.FC<TopbarProps> = ({
                 boxShadow: '0 2px 4px rgba(76, 29, 149, 0.25)',
               }}
             >
-              {user.avatar}
+              {user.name ? user.name.charAt(0).toUpperCase() : 'U'}
             </div>
             <div style={{ textAlign: 'left', lineHeight: 1.2 }}>
               <div style={{ fontSize: 13.5, fontWeight: 700, color: '#0F172A' }}>{user.name}</div>
@@ -407,7 +409,8 @@ export const Topbar: React.FC<TopbarProps> = ({
 
               <div
                 onClick={() => {
-                  onNavigate('login');
+                  if (onLogout) onLogout();
+                  else onNavigate('login');
                   setShowProfileMenu(false);
                 }}
                 style={{

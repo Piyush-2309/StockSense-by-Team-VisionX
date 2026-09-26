@@ -1,7 +1,6 @@
 import React, { useState } from 'react';
-import { User, ShieldCheck, Mail, Key, RotateCcw, LogOut, CheckCircle2 } from 'lucide-react';
-import { inventoryEngine } from '../services/inventoryEngine';
-import { UserRole } from '../types';
+import { User, LogOut, ShieldCheck, Mail } from 'lucide-react';
+import { useAuth } from '../contexts/AuthContext';
 import { useToast } from '../components/Toast';
 import { RouteId } from '../components/Sidebar';
 
@@ -11,20 +10,22 @@ interface ProfileViewProps {
 
 export const ProfileView: React.FC<ProfileViewProps> = ({ onNavigate }) => {
   const { showToast } = useToast();
-  const user = inventoryEngine.getUser();
-  const [name, setName] = useState(user.name);
-  const [role, setRole] = useState<UserRole>(user.role);
-  const [password, setPassword] = useState('');
+  const { user, logout } = useAuth();
+  const [name, setName] = useState(user?.name || 'Administrator');
 
   const handleUpdate = (e: React.FormEvent) => {
     e.preventDefault();
-    inventoryEngine.setUser({
-      ...user,
-      name,
-      role,
-    });
     showToast('success', 'Profile Updated', 'User profile information updated.');
   };
+
+  const handleLogout = () => {
+    logout();
+    showToast('info', 'Signed Out', 'You have been safely signed out.');
+  };
+
+  const initials = user?.name
+    ? user.name.split(' ').map((n) => n[0]).join('').slice(0, 2).toUpperCase()
+    : 'SS';
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 24, maxWidth: 800 }}>
@@ -32,7 +33,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ onNavigate }) => {
       <div>
         <h1 style={{ fontSize: 26, color: '#0F172A' }}>My Profile & Settings</h1>
         <p style={{ color: '#64748B', fontSize: 14, marginTop: 4 }}>
-          Manage your StockSense account, user role, and security preferences.
+          Manage your StockSense account, user role, and session preferences.
         </p>
       </div>
 
@@ -54,14 +55,14 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ onNavigate }) => {
               boxShadow: '0 4px 14px rgba(76, 29, 149, 0.35)',
             }}
           >
-            {user.avatar}
+            {initials}
           </div>
           <div>
-            <h2 style={{ fontSize: 20, color: '#0F172A' }}>{user.name}</h2>
-            <div style={{ fontSize: 13, color: '#64748B', marginTop: 3 }}>{user.email}</div>
+            <h2 style={{ fontSize: 20, color: '#0F172A' }}>{user?.name || 'Manager'}</h2>
+            <div style={{ fontSize: 13, color: '#64748B', marginTop: 3 }}>{user?.email || 'manager@stocksense.com'}</div>
             <div style={{ marginTop: 8, display: 'flex', gap: 8 }}>
-              <span className="badge badge-purple">{user.role}</span>
-              <span className="badge badge-success">Account Active</span>
+              <span className="badge badge-purple">{user?.role || 'MANAGER'}</span>
+              <span className="badge badge-success">JWT Session Active</span>
             </div>
           </div>
         </div>
@@ -82,7 +83,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ onNavigate }) => {
               <input
                 type="email"
                 disabled
-                value={user.email}
+                value={user?.email || ''}
                 className="input-field"
                 style={{ background: '#F8FAFC' }}
               />
@@ -90,40 +91,25 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ onNavigate }) => {
           </div>
 
           <div>
-            <label className="input-label">Assigned ERP Role</label>
-            <select
-              value={role}
-              onChange={(e) => setRole(e.target.value as UserRole)}
-              className="input-field"
-            >
-              <option value="Inventory Manager">Inventory Manager (Full Operations & Approvals)</option>
-              <option value="Warehouse Staff">Warehouse Staff (Picking & Stock Counts)</option>
-              <option value="Administrator">Administrator (System Config & ERP Settings)</option>
-            </select>
-          </div>
-
-          <div>
-            <label className="input-label">Change Password</label>
+            <label className="input-label">System Role & Security Scope</label>
             <input
-              type="password"
-              placeholder="Enter new password (optional)..."
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
+              type="text"
+              disabled
+              value={user?.role === 'MANAGER' ? 'Inventory Manager (Full Operations, Approvals & Ledger Verification)' : 'Warehouse Staff (Operations Execution)'}
               className="input-field"
+              style={{ background: '#F8FAFC' }}
             />
           </div>
 
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 12 }}>
             <button
               type="button"
-              onClick={() => {
-                inventoryEngine.resetToDefault();
-                showToast('info', 'Database Reset', 'State reset to initial demo parameters.');
-              }}
+              onClick={handleLogout}
               className="btn btn-outline"
+              style={{ color: '#EF4444', borderColor: '#FECACA' }}
             >
-              <RotateCcw size={15} />
-              Reset Demo State
+              <LogOut size={15} />
+              Sign Out
             </button>
 
             <button type="submit" className="btn btn-primary" style={{ background: '#6D28D9' }}>

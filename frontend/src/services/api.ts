@@ -1,269 +1,208 @@
-import { inventoryEngine } from './inventoryEngine';
-import {
-  Product,
-  Warehouse,
-  Location,
-  StockQuant,
-  Receipt,
-  Delivery,
-  InternalTransfer,
-  Adjustment,
-  StockLedgerEntry,
-  CycleCount,
-  Category,
-  ReorderingRule,
-  Notification,
-  User,
-  DashboardStats,
+/**
+ * StockSense API Service Layer
+ *
+ * Every method calls the real Spring Boot backend via apiClient.
+ * NO mock data. NO inventoryEngine. The backend is the source of truth.
+ */
+
+import { apiClient } from './apiClient';
+import type {
+  ProductResponse,
+  ProductRequest,
+  CategoryResponse,
+  WarehouseResponse,
+  LocationResponse,
+  StockResponse,
+  DocumentResponse,
+  DashboardData,
+  PagedResponse,
+  ReceiptRequest,
+  DeliveryRequest,
+  TransferRequest,
+  AdjustmentRequest,
 } from '../types';
 
-/**
- * StockSense Centralized API Client
- * Mimics RESTful endpoints conforming to enterprise specification
- */
-export const api = {
-  // --- AUTH ---
-  auth: {
-    getCurrentUser: async (): Promise<User> => {
-      return inventoryEngine.getUser();
-    },
-    updateProfile: async (data: Partial<User>): Promise<User> => {
-      const current = inventoryEngine.getUser();
-      const updated = { ...current, ...data };
-      inventoryEngine.setUser(updated);
-      return updated;
-    },
-    login: async (email: string): Promise<User> => {
-      return inventoryEngine.getUser();
-    },
+// ========================
+// Dashboard
+// ========================
+export const dashboardService = {
+  getDashboard: () => apiClient.get<DashboardData>('/api/v1/dashboard'),
+};
+
+// ========================
+// Products
+// ========================
+export const productService = {
+  list: (params?: { q?: string; categoryId?: number; page?: number; size?: number; sort?: string }) => {
+    const sp = new URLSearchParams();
+    if (params?.q) sp.set('q', params.q);
+    if (params?.categoryId) sp.set('categoryId', String(params.categoryId));
+    sp.set('page', String(params?.page ?? 0));
+    sp.set('size', String(params?.size ?? 100));
+    if (params?.sort) sp.set('sort', params.sort);
+    return apiClient.get<PagedResponse<ProductResponse>>(`/api/v1/products?${sp}`);
   },
+  getById: (id: number) => apiClient.get<ProductResponse>(`/api/v1/products/${id}`),
+  create: (data: ProductRequest) => apiClient.post<ProductResponse>('/api/v1/products', data),
+  update: (id: number, data: ProductRequest) => apiClient.put<ProductResponse>(`/api/v1/products/${id}`, data),
+  remove: (id: number) => apiClient.delete<void>(`/api/v1/products/${id}`),
+};
 
-  // --- DASHBOARD ---
-  dashboard: {
-    getStats: async (warehouseId?: string): Promise<DashboardStats> => {
-      return inventoryEngine.getDashboardStats(warehouseId);
-    },
-    getStockByLocation: async () => {
-      return inventoryEngine.getStockByLocationBreakdown();
-    },
-    getOperationsToday: async () => {
-      const state = inventoryEngine.getState();
-      const recentReceipts = state.receipts.slice(0, 3).map((r) => ({
-        id: r.reference,
-        type: 'Receipt' as const,
-        product: r.items[0]?.productName || 'Multiple items',
-        quantity: `+${r.items.reduce((s, i) => s + (i.receivedQty || i.orderedQty), 0)} ${r.items[0]?.uom || 'units'}`,
-        status: r.status,
-        time: r.date.split(' ').slice(-2).join(' '),
-        rawId: r.id,
-      }));
+// ========================
+// Categories
+// ========================
+export const categoryService = {
+  list: () => apiClient.get<CategoryResponse[]>('/api/v1/categories'),
+  getById: (id: number) => apiClient.get<CategoryResponse>(`/api/v1/categories/${id}`),
+  create: (data: { name: string; description?: string }) =>
+    apiClient.post<CategoryResponse>('/api/v1/categories', data),
+  update: (id: number, data: { name: string; description?: string }) =>
+    apiClient.put<CategoryResponse>(`/api/v1/categories/${id}`, data),
+  remove: (id: number) => apiClient.delete<void>(`/api/v1/categories/${id}`),
+};
 
-      const recentDeliveries = state.deliveries.slice(0, 3).map((d) => ({
-        id: d.reference,
-        type: 'Delivery' as const,
-        product: d.items[0]?.productName || 'Multiple items',
-        quantity: `-${d.items.reduce((s, i) => s + (i.deliveredQty || i.requestedQty), 0)} ${d.items[0]?.uom || 'units'}`,
-        status: d.status,
-        time: d.date.split(' ').slice(-2).join(' '),
-        rawId: d.id,
-      }));
+// ========================
+// Warehouses
+// ========================
+export const warehouseService = {
+  list: () => apiClient.get<WarehouseResponse[]>('/api/v1/warehouses'),
+  getById: (id: number) => apiClient.get<WarehouseResponse>(`/api/v1/warehouses/${id}`),
+  create: (data: { name: string; code: string; address?: string }) =>
+    apiClient.post<WarehouseResponse>('/api/v1/warehouses', data),
+  update: (id: number, data: { name: string; code: string; address?: string }) =>
+    apiClient.put<WarehouseResponse>(`/api/v1/warehouses/${id}`, data),
+};
 
-      const recentTransfers = state.transfers.slice(0, 3).map((t) => ({
-        id: t.reference,
-        type: 'Transfer' as const,
-        product: t.items[0]?.productName || 'Multiple items',
-        quantity: `+${t.items.reduce((s, i) => s + i.quantity, 0)} ${t.items[0]?.uom || 'units'}`,
-        status: t.status,
-        time: t.date.split(' ').slice(-2).join(' '),
-        rawId: t.id,
-      }));
-
-      const recentAdjustments = state.adjustments.slice(0, 3).map((a) => ({
-        id: a.reference,
-        type: 'Adjustment' as const,
-        product: a.productName,
-        quantity: `${a.variance > 0 ? '+' : ''}${a.variance} ${a.uom}`,
-        status: a.status === 'Applied' ? 'Done' : 'Draft',
-        time: a.date.split(' ').slice(-2).join(' '),
-        rawId: a.id,
-      }));
-
-      return [...recentReceipts, ...recentDeliveries, ...recentTransfers, ...recentAdjustments].slice(0, 6);
-    },
-    getRecentStockMovement: async (limit = 5): Promise<StockLedgerEntry[]> => {
-      return inventoryEngine.getLedger().slice(0, limit);
-    },
+// ========================
+// Locations
+// ========================
+export const locationService = {
+  list: (params?: { warehouseId?: number; parentLocationId?: number; active?: boolean }) => {
+    const sp = new URLSearchParams();
+    if (params?.warehouseId) sp.set('warehouseId', String(params.warehouseId));
+    if (params?.parentLocationId) sp.set('parentLocationId', String(params.parentLocationId));
+    if (params?.active !== undefined) sp.set('active', String(params.active));
+    const q = sp.toString();
+    return apiClient.get<LocationResponse[]>(`/api/v1/locations${q ? '?' + q : ''}`);
   },
+  getById: (id: number) => apiClient.get<LocationResponse>(`/api/v1/locations/${id}`),
+  create: (data: { name: string; code: string; warehouseId: number; parentLocationId?: number }) =>
+    apiClient.post<LocationResponse>('/api/v1/locations', data),
+  update: (id: number, data: { name: string; code: string; warehouseId: number; parentLocationId?: number }) =>
+    apiClient.put<LocationResponse>(`/api/v1/locations/${id}`, data),
+  remove: (id: number) => apiClient.delete<void>(`/api/v1/locations/${id}`),
+};
 
-  // --- PRODUCTS ---
-  products: {
-    list: async (filters?: { search?: string; categoryId?: string; status?: string }): Promise<Product[]> => {
-      let list = inventoryEngine.getProducts();
-      if (filters?.search) {
-        const query = filters.search.toLowerCase();
-        list = list.filter((p) => p.name.toLowerCase().includes(query) || p.sku.toLowerCase().includes(query));
-      }
-      if (filters?.categoryId && filters.categoryId !== 'all') {
-        list = list.filter((p) => p.categoryId === filters.categoryId);
-      }
-      if (filters?.status && filters.status !== 'all') {
-        list = list.filter((p) => p.status === filters.status);
-      }
-      return list;
-    },
-    getById: async (id: string): Promise<Product | undefined> => {
-      return inventoryEngine.getProductById(id);
-    },
-    create: async (data: Parameters<typeof inventoryEngine.createProduct>[0]) => {
-      return inventoryEngine.createProduct(data);
-    },
-  },
+// ========================
+// Stock
+// ========================
+export const stockService = {
+  list: () => apiClient.get<StockResponse[]>('/api/v1/stock'),
+  byProduct: (productId: number) => apiClient.get<StockResponse[]>(`/api/v1/stock/product/${productId}`),
+  byLocation: (locationId: number) => apiClient.get<StockResponse[]>(`/api/v1/stock/location/${locationId}`),
+  updateDirectly: (stockId: number, data: { newQuantityOnHand: number; reason: string }) =>
+    apiClient.patch<DocumentResponse>(`/api/v1/stock/${stockId}`, data),
+};
 
-  // --- WAREHOUSES & LOCATIONS ---
-  warehouses: {
-    list: async (): Promise<Warehouse[]> => {
-      return inventoryEngine.getWarehouses();
-    },
+// ========================
+// Receipts
+// ========================
+export const receiptService = {
+  list: (params?: { status?: string; page?: number; size?: number }) => {
+    const sp = new URLSearchParams();
+    if (params?.status) sp.set('status', params.status);
+    sp.set('page', String(params?.page ?? 0));
+    sp.set('size', String(params?.size ?? 100));
+    return apiClient.get<PagedResponse<DocumentResponse>>(`/api/v1/receipts?${sp}`);
   },
-  locations: {
-    list: async (warehouseId?: string): Promise<Location[]> => {
-      return inventoryEngine.getLocations(warehouseId);
-    },
-  },
+  getById: (documentId: string) => apiClient.get<DocumentResponse>(`/api/v1/receipts/${documentId}`),
+  create: (data: ReceiptRequest) => apiClient.post<DocumentResponse>('/api/v1/receipts', data),
+  update: (documentId: string, data: ReceiptRequest) =>
+    apiClient.put<DocumentResponse>(`/api/v1/receipts/${documentId}`, data),
+  markReady: (documentId: string) =>
+    apiClient.patch<DocumentResponse>(`/api/v1/receipts/${documentId}/mark-ready`),
+  validate: (documentId: string) =>
+    apiClient.patch<DocumentResponse>(`/api/v1/receipts/${documentId}/validate`),
+  cancel: (documentId: string) =>
+    apiClient.patch<DocumentResponse>(`/api/v1/receipts/${documentId}/cancel`),
+};
 
-  // --- STOCK & QUANTS ---
-  stock: {
-    getQuants: async (productId?: string, warehouseId?: string, locationId?: string): Promise<StockQuant[]> => {
-      return inventoryEngine.getQuants(productId, warehouseId, locationId);
-    },
+// ========================
+// Deliveries
+// ========================
+export const deliveryService = {
+  list: (params?: { status?: string; page?: number; size?: number }) => {
+    const sp = new URLSearchParams();
+    if (params?.status) sp.set('status', params.status);
+    sp.set('page', String(params?.page ?? 0));
+    sp.set('size', String(params?.size ?? 100));
+    return apiClient.get<PagedResponse<DocumentResponse>>(`/api/v1/deliveries?${sp}`);
   },
+  getById: (documentId: string) => apiClient.get<DocumentResponse>(`/api/v1/deliveries/${documentId}`),
+  create: (data: DeliveryRequest) => apiClient.post<DocumentResponse>('/api/v1/deliveries', data),
+  update: (documentId: string, data: DeliveryRequest) =>
+    apiClient.put<DocumentResponse>(`/api/v1/deliveries/${documentId}`, data),
+  checkAvailability: (documentId: string) =>
+    apiClient.patch<DocumentResponse>(`/api/v1/deliveries/${documentId}/check-availability`),
+  validate: (documentId: string) =>
+    apiClient.patch<DocumentResponse>(`/api/v1/deliveries/${documentId}/validate`),
+  cancel: (documentId: string) =>
+    apiClient.patch<DocumentResponse>(`/api/v1/deliveries/${documentId}/cancel`),
+};
 
-  // --- OPERATIONS ---
-  receipts: {
-    list: async (): Promise<Receipt[]> => {
-      return inventoryEngine.getReceipts();
-    },
-    create: async (data: Parameters<typeof inventoryEngine.createReceipt>[0]) => {
-      return inventoryEngine.createReceipt(data);
-    },
-    validate: async (id: string) => {
-      return inventoryEngine.validateReceipt(id);
-    },
+// ========================
+// Transfers
+// ========================
+export const transferService = {
+  list: (params?: { status?: string; page?: number; size?: number }) => {
+    const sp = new URLSearchParams();
+    if (params?.status) sp.set('status', params.status);
+    sp.set('page', String(params?.page ?? 0));
+    sp.set('size', String(params?.size ?? 100));
+    return apiClient.get<PagedResponse<DocumentResponse>>(`/api/v1/transfers?${sp}`);
   },
+  getById: (documentId: string) => apiClient.get<DocumentResponse>(`/api/v1/transfers/${documentId}`),
+  create: (data: TransferRequest) => apiClient.post<DocumentResponse>('/api/v1/transfers', data),
+  update: (documentId: string, data: TransferRequest) =>
+    apiClient.put<DocumentResponse>(`/api/v1/transfers/${documentId}`, data),
+  validate: (documentId: string) =>
+    apiClient.patch<DocumentResponse>(`/api/v1/transfers/${documentId}/validate`),
+  cancel: (documentId: string) =>
+    apiClient.patch<DocumentResponse>(`/api/v1/transfers/${documentId}/cancel`),
+};
 
-  deliveries: {
-    list: async (): Promise<Delivery[]> => {
-      return inventoryEngine.getDeliveries();
-    },
-    create: async (data: Parameters<typeof inventoryEngine.createDelivery>[0]) => {
-      return inventoryEngine.createDelivery(data);
-    },
-    validate: async (id: string) => {
-      return inventoryEngine.validateDelivery(id);
-    },
+// ========================
+// Adjustments
+// ========================
+export const adjustmentService = {
+  list: (params?: { status?: string; page?: number; size?: number }) => {
+    const sp = new URLSearchParams();
+    if (params?.status) sp.set('status', params.status);
+    sp.set('page', String(params?.page ?? 0));
+    sp.set('size', String(params?.size ?? 100));
+    return apiClient.get<PagedResponse<DocumentResponse>>(`/api/v1/adjustments?${sp}`);
   },
+  getById: (documentId: string) => apiClient.get<DocumentResponse>(`/api/v1/adjustments/${documentId}`),
+  create: (data: AdjustmentRequest) => apiClient.post<DocumentResponse>('/api/v1/adjustments', data),
+  validate: (documentId: string) =>
+    apiClient.patch<DocumentResponse>(`/api/v1/adjustments/${documentId}/validate`),
+  cancel: (documentId: string) =>
+    apiClient.patch<DocumentResponse>(`/api/v1/adjustments/${documentId}/cancel`),
+};
 
-  transfers: {
-    list: async (): Promise<InternalTransfer[]> => {
-      return inventoryEngine.getTransfers();
-    },
-    createAndExecute: async (data: Parameters<typeof inventoryEngine.createAndExecuteTransfer>[0]) => {
-      return inventoryEngine.createAndExecuteTransfer(data);
-    },
+// ========================
+// Moves / Ledger
+// ========================
+export const ledgerService = {
+  list: (params?: { type?: string; status?: string; productId?: number; search?: string; page?: number; size?: number }) => {
+    const sp = new URLSearchParams();
+    if (params?.type) sp.set('type', params.type);
+    if (params?.status) sp.set('status', params.status);
+    if (params?.productId) sp.set('productId', String(params.productId));
+    if (params?.search) sp.set('search', params.search);
+    sp.set('page', String(params?.page ?? 0));
+    sp.set('size', String(params?.size ?? 100));
+    return apiClient.get<PagedResponse<DocumentResponse>>(`/api/v1/moves?${sp}`);
   },
-
-  adjustments: {
-    list: async (): Promise<Adjustment[]> => {
-      return inventoryEngine.getAdjustments();
-    },
-    apply: async (data: Parameters<typeof inventoryEngine.applyAdjustment>[0]) => {
-      return inventoryEngine.applyAdjustment(data);
-    },
-  },
-
-  // --- LEDGER ---
-  ledger: {
-    list: async (filters?: { product?: string; type?: string; warehouse?: string; user?: string }): Promise<StockLedgerEntry[]> => {
-      let list = inventoryEngine.getLedger();
-      if (filters?.product) {
-        const query = filters.product.toLowerCase();
-        list = list.filter((e) => e.productName.toLowerCase().includes(query) || e.sku.toLowerCase().includes(query));
-      }
-      if (filters?.type && filters.type !== 'all') {
-        list = list.filter((e) => e.type === filters.type);
-      }
-      if (filters?.user && filters.user !== 'all') {
-        list = list.filter((e) => e.user.toLowerCase().includes(filters.user!.toLowerCase()));
-      }
-      return list;
-    },
-  },
-
-  // --- RISK & REORDER ---
-  risk: {
-    getRisks: async () => {
-      const products = inventoryEngine.getProducts();
-      return products.filter((p) => p.status === 'Out of Stock' || p.status === 'Below Minimum' || p.status === 'Low Stock' || p.status === 'High Consumption');
-    },
-  },
-  reorder: {
-    getRecommendations: async () => {
-      const products = inventoryEngine.getProducts();
-      const rules = inventoryEngine.getReorderRules();
-      return products
-        .filter((p) => p.totalStock <= p.reorderLevel)
-        .map((p) => {
-          const rule = rules.find((r) => r.productId === p.id);
-          const target = rule ? rule.targetQuantity : p.targetLevel;
-          const recommendedQty = Math.max(0, target - p.totalStock);
-          return {
-            product: p,
-            currentStock: p.totalStock,
-            minStock: p.reorderLevel,
-            targetStock: target,
-            recommendedQty,
-          };
-        });
-    },
-  },
-
-  // --- CYCLE COUNTS ---
-  cycleCounts: {
-    list: async (): Promise<CycleCount[]> => {
-      return inventoryEngine.getCycleCounts();
-    },
-    update: async (id: string, count: number) => {
-      return inventoryEngine.updateCycleCount(id, count);
-    },
-    complete: async (id: string) => {
-      return inventoryEngine.completeCycleCount(id);
-    },
-  },
-
-  // --- CATEGORIES ---
-  categories: {
-    list: async (): Promise<Category[]> => {
-      return inventoryEngine.getCategories();
-    },
-  },
-
-  // --- REORDER RULES ---
-  reorderRules: {
-    list: async (): Promise<ReorderingRule[]> => {
-      return inventoryEngine.getReorderRules();
-    },
-  },
-
-  // --- NOTIFICATIONS ---
-  notifications: {
-    list: async (): Promise<Notification[]> => {
-      return inventoryEngine.getNotifications();
-    },
-    markRead: async (id: string) => {
-      inventoryEngine.markNotificationAsRead(id);
-    },
-    markAllRead: async () => {
-      inventoryEngine.markAllNotificationsAsRead();
-    },
-  },
+  getById: (documentId: string) => apiClient.get<DocumentResponse>(`/api/v1/moves/${documentId}`),
 };

@@ -1,48 +1,86 @@
-import React, { useState } from 'react';
-import { MapPin, Plus, Building, X } from 'lucide-react';
-import { inventoryEngine } from '../services/inventoryEngine';
+import React, { useState, useEffect } from 'react';
+import { MapPin, Plus, X, Loader2 } from 'lucide-react';
+import { locationService, warehouseService, stockService } from '../services/api';
+import { LocationResponse, WarehouseResponse, StockResponse } from '../types';
 import { useToast } from '../components/Toast';
 import { RouteId } from '../components/Sidebar';
 
 interface LocationsViewProps {
   onNavigate: (route: RouteId) => void;
+  refreshKey?: number;
 }
 
-export const LocationsView: React.FC<LocationsViewProps> = ({ onNavigate }) => {
+export const LocationsView: React.FC<LocationsViewProps> = ({ onNavigate, refreshKey = 0 }) => {
   const { showToast } = useToast();
-  const locations = inventoryEngine.getLocations();
-  const warehouses = inventoryEngine.getWarehouses();
+  const [locations, setLocations] = useState<LocationResponse[]>([]);
+  const [warehouses, setWarehouses] = useState<WarehouseResponse[]>([]);
+  const [stocks, setStocks] = useState<StockResponse[]>([]);
+  const [loading, setLoading] = useState(true);
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+
   const [formData, setFormData] = useState({
     name: '',
     code: '',
-    warehouseId: 'wh-main',
-    type: 'Internal' as const,
+    warehouseId: 0,
   });
 
-  const handleAddLocation = (e: React.FormEvent) => {
+  const fetchData = async () => {
+    setLoading(true);
+    try {
+      const [locRes, whRes, stockRes] = await Promise.all([
+        locationService.list(),
+        warehouseService.list(),
+        stockService.list().catch(() => [] as StockResponse[]),
+      ]);
+      setLocations(locRes || []);
+      setWarehouses(whRes || []);
+      setStocks(stockRes || []);
+
+      if (formData.warehouseId === 0 && whRes?.length > 0) {
+        setFormData((prev) => ({ ...prev, warehouseId: whRes[0].id }));
+      }
+    } catch (err) {
+      console.error('Failed to load locations:', err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchData();
+  }, [refreshKey]);
+
+  const handleAddLocation = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!formData.name.trim() || !formData.code.trim()) {
       showToast('error', 'Validation Error', 'Rack Name and Code are required.');
       return;
     }
 
-    const state = inventoryEngine.getState();
-    const wh = warehouses.find((w) => w.id === formData.warehouseId);
-    state.locations.push({
-      id: `loc-${Date.now()}`,
-      warehouseId: formData.warehouseId,
-      warehouseName: wh?.name || 'Warehouse',
-      code: formData.code.toUpperCase(),
-      name: formData.name,
-      type: formData.type,
-      status: 'Active',
-    });
+    const whId = formData.warehouseId || warehouses[0]?.id;
+    if (!whId) {
+      showToast('error', 'Warehouse Required', 'Please choose a warehouse facility.');
+      return;
+    }
 
-    inventoryEngine.resetToDefault();
-    showToast('success', 'Location Created', `Location ${formData.name} added.`);
-    setIsModalOpen(false);
-    setFormData({ name: '', code: '', warehouseId: 'wh-main', type: 'Internal' });
+    setSubmitting(true);
+    try {
+      await locationService.create({
+        name: formData.name.trim(),
+        code: formData.code.trim().toUpperCase(),
+        warehouseId: whId,
+      });
+
+      showToast('success', 'Location Created', `Location ${formData.name} added.`);
+      setIsModalOpen(false);
+      setFormData({ name: '', code: '', warehouseId: warehouses[0]?.id || 0 });
+      fetchData();
+    } catch (err: any) {
+      showToast('error', 'Creation Failed', err?.message || 'Could not create location');
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   return (
@@ -65,54 +103,60 @@ export const LocationsView: React.FC<LocationsViewProps> = ({ onNavigate }) => {
         </button>
       </div>
 
-      {/* Locations Table */}
-      <div className="table-container">
-        <table className="enterprise-table">
-          <thead>
-            <tr>
-              <th>Location Name</th>
-              <th>Code</th>
-              <th>Warehouse</th>
-              <th>Type</th>
-              <th>Status</th>
-              <th style={{ textAlign: 'right' }}>Action</th>
-            </tr>
-          </thead>
-          <tbody>
-            {locations.map((loc) => {
-              const quants = inventoryEngine.getQuants(undefined, undefined, loc.id);
-              const totalUnits = quants.reduce((s, q) => s + q.quantity, 0);
+      {loading && (
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '48px 0', gap: 12 }}>
+          <Loader2 size={28} color="#6D28D9" className="animate-spin" />
+          <span style={{ color: '#64748B', fontSize: 14 }}>Loading warehouse locations…</span>
+        </div>
+      )}
 
-              return (
-                <tr key={loc.id}>
-                  <td>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                      <MapPin size={16} color="#6D28D9" />
-                      <strong style={{ color: '#0F172A' }}>{loc.name}</strong>
-                    </div>
-                  </td>
-                  <td style={{ fontWeight: 600, color: '#6D28D9' }}>{loc.code}</td>
-                  <td style={{ color: '#334155' }}>{loc.warehouseName}</td>
-                  <td>
-                    <span className="badge badge-neutral">{loc.type}</span>
-                  </td>
-                  <td>
-                    <span className="badge badge-success">
-                      <span className="badge-dot" />
-                      Active
-                    </span>
-                  </td>
-                  <td style={{ textAlign: 'right' }}>
-                    <span style={{ fontSize: 13, fontWeight: 700, color: '#0F172A' }}>
-                      {totalUnits.toLocaleString()} units
-                    </span>
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
+      {/* Locations Table */}
+      {!loading && (
+        <div className="table-container">
+          <table className="enterprise-table">
+            <thead>
+              <tr>
+                <th>Location Name</th>
+                <th>Code</th>
+                <th>Warehouse</th>
+                <th>Status</th>
+                <th style={{ textAlign: 'right' }}>Units On Hand</th>
+              </tr>
+            </thead>
+            <tbody>
+              {locations.map((loc) => {
+                const totalUnits = stocks
+                  .filter((s) => s.locationId === loc.id)
+                  .reduce((acc, q) => acc + q.quantityOnHand, 0);
+
+                return (
+                  <tr key={loc.id}>
+                    <td>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                        <MapPin size={16} color="#6D28D9" />
+                        <strong style={{ color: '#0F172A' }}>{loc.name}</strong>
+                      </div>
+                    </td>
+                    <td style={{ fontWeight: 600, color: '#6D28D9' }}>{loc.code}</td>
+                    <td style={{ color: '#334155' }}>{loc.warehouseName}</td>
+                    <td>
+                      <span className="badge badge-success">
+                        <span className="badge-dot" />
+                        Active
+                      </span>
+                    </td>
+                    <td style={{ textAlign: 'right' }}>
+                      <span style={{ fontSize: 13, fontWeight: 700, color: '#0F172A' }}>
+                        {totalUnits.toLocaleString()} units
+                      </span>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
 
       {/* Modal */}
       {isModalOpen && (
@@ -166,7 +210,7 @@ export const LocationsView: React.FC<LocationsViewProps> = ({ onNavigate }) => {
                   <label className="input-label">Warehouse</label>
                   <select
                     value={formData.warehouseId}
-                    onChange={(e) => setFormData({ ...formData, warehouseId: e.target.value })}
+                    onChange={(e) => setFormData({ ...formData, warehouseId: Number(e.target.value) })}
                     className="input-field"
                   >
                     {warehouses.map((w) => (
@@ -177,11 +221,11 @@ export const LocationsView: React.FC<LocationsViewProps> = ({ onNavigate }) => {
               </div>
 
               <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12, marginTop: 8 }}>
-                <button type="button" onClick={() => setIsModalOpen(false)} className="btn btn-outline">
+                <button type="button" onClick={() => setIsModalOpen(false)} className="btn btn-outline" disabled={submitting}>
                   Cancel
                 </button>
-                <button type="submit" className="btn btn-primary" style={{ background: '#6D28D9' }}>
-                  Save Location
+                <button type="submit" className="btn btn-primary" style={{ background: '#6D28D9' }} disabled={submitting}>
+                  {submitting ? <Loader2 size={16} className="animate-spin" /> : 'Save Location'}
                 </button>
               </div>
             </form>
