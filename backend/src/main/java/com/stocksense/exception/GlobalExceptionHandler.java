@@ -1,10 +1,12 @@
 package com.stocksense.exception;
 
 import com.stocksense.dto.ApiResponse;
+import jakarta.persistence.OptimisticLockException;
 import jakarta.servlet.http.HttpServletRequest;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.security.access.AccessDeniedException;
 import org.springframework.security.authentication.BadCredentialsException;
 import org.springframework.security.core.AuthenticationException;
@@ -102,8 +104,18 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(InvalidStateTransitionException.class)
     public ResponseEntity<ApiResponse<Void>> handleInvalidStateTransition(
             InvalidStateTransitionException ex, HttpServletRequest request) {
-        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+        return ResponseEntity.status(HttpStatus.CONFLICT)
                 .body(ApiResponse.error("INVALID_STATE_TRANSITION", ex.getMessage(), request.getRequestURI()));
+    }
+
+    @ExceptionHandler({OptimisticLockException.class, ObjectOptimisticLockingFailureException.class})
+    public ResponseEntity<ApiResponse<Void>> handleOptimisticLock(
+            Exception ex, HttpServletRequest request) {
+        log.warn("Concurrent modification detected at {}: {}", request.getRequestURI(), ex.getMessage());
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(ApiResponse.error("CONCURRENT_MODIFICATION",
+                        "This record was modified by another request. Please retry.",
+                        request.getRequestURI()));
     }
 
     @ExceptionHandler(InvalidTransferException.class)

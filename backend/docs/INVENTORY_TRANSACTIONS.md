@@ -1,138 +1,89 @@
-# StockSense — Inventory Transactions Design
+# Inventory Transactions — Concurrency & Safety Design
 
-## Overview
+## Concurrency Strategy
 
-This document describes the shared conventions for how inventory transactions
-(receipts, deliveries, transfers, adjustments) interact with the `stock` and
-`stock_moves` tables. **Both backend developers must agree on this before
-writing transaction code.**
+StockSense uses a **hybrid locking strategy** to prevent concurrent modification conflicts:
 
----
+### Optimistic Locking (`Stock.version`)
 
-## StockMove Lifecycle (Section 3A)
+The `Stock` entity has a `@Version` field that Hibernate automatically increments on each update. If two transactions read the same stock row, modify it, and try to commit, the second one will fail with an `OptimisticLockException` — which we catch and map to a **409 CONCURRENT_MODIFICATION** response:
 
-```
-                  ┌──────────┐
-     Receipts ──▶ │  DRAFT   │──── validate ──▶ DONE (stock updated)
-     Transfers ─▶ │          │──── cancel ────▶ CANCELED
-     Adjustments▶ └──────────┘
-
-                  ┌──────────┐    check     ┌──────────┐
-     Deliveries ▶ │ WAITING  │───────────▶  │  READY   │── validate ──▶ DONE
-                  │          │              │(reserved) │── cancel ────▶ CANCELED
-                  └──────────┘              └──────────┘
-                       │                         │
-                       └──── cancel ─────────────┘──▶ CANCELED
+```json
+{
+  "success": false,
+  "code": "CONCURRENT_MODIFICATION",
+  "message": "This record was modified by another request. Please retry.",
+  "path": "/api/v1/deliveries/{documentId}/validate",
+  "timestamp": "..."
+}
 ```
 
-### Status Meanings
+### Pessimistic Write Locks (for stock mutations)
 
-| Status   | Stock Impact | Description                                  |
-|----------|-------------|----------------------------------------------|
-| DRAFT    | None        | Document created, no stock changes            |
-| WAITING  | None        | Delivery created, stock not yet available     |
-| READY    | Reserved    | Delivery stock reserved (`quantity_reserved`) |
-| DONE     | Applied     | Stock quantities updated (`quantity_on_hand`) |
-| CANCELED | Reversed    | Any reservations released, no net effect      |
+For all stock-changing operations (receipt validate, delivery validate, transfer validate, adjustment validate), we use `StockRepository.findByProductIdAndLocationIdForUpdate()` which acquires a **`SELECT ... FOR UPDATE`** row-level lock. This serializes concurrent writes to the same product-location stock row:
 
----
-
-## quantityReserved Convention
-
-**Decision: Reserve at READY status for deliveries.**
-
-When a delivery transitions from WAITING → READY:
-- `stock.quantity_reserved` is **incremented** by the delivery line quantity
-- This ensures the "Free to Use" value (`quantity_on_hand - quantity_reserved`)
-  accurately reflects what's actually available
-
-When a delivery transitions from READY → DONE:
-- `stock.quantity_on_hand` is **decremented** by the delivery line quantity
-- `stock.quantity_reserved` is **decremented** by the delivery line quantity
-
-When a delivery transitions from READY → CANCELED:
-- `stock.quantity_reserved` is **decremented** (reservation released)
-- `stock.quantity_on_hand` is **NOT changed**
-
-When a delivery transitions from WAITING → CANCELED:
-- No stock changes (nothing was reserved)
-
-### Free-to-Use Calculation
-
-```
-free_to_use = quantity_on_hand - quantity_reserved
+```text
+Transaction A: SELECT s FROM Stock WHERE product=1 AND location=1 FOR UPDATE → locks row
+Transaction B: SELECT s FROM Stock WHERE product=1 AND location=1 FOR UPDATE → BLOCKS until A commits
 ```
 
-This is **derived in the DTO/service layer**, never persisted.
+This prevents the "double spend" problem described in Section 8:
+- Stock = 10
+- Request A wants 8, Request B wants 7
+- Both cannot see 10 and succeed independently
+- Only one succeeds; the other sees the updated quantity and fails with INSUFFICIENT_STOCK
 
----
+### Why Both?
 
-## Stock Update Rules by Operation Type
+- **Pessimistic locks** (FOR UPDATE) are the primary defense — they serialize concurrent stock mutations
+- **Optimistic locking** (@Version) is the safety net — it catches any case we might have missed, e.g. bulk updates that bypass the FOR UPDATE query
 
-### RECEIPT (DRAFT → DONE)
-- `destination_location` required, `source_location` null
-- On DONE: **increment** `stock.quantity_on_hand` at destination location
-- `resulting_quantity` = new on-hand after increment
+## Transaction Boundaries
 
-### DELIVERY (WAITING/READY → DONE)
-- `source_location` required, `destination_location` null
-- On READY: **increment** `stock.quantity_reserved` at source location
-- On DONE: **decrement** `stock.quantity_on_hand` and `stock.quantity_reserved`
-- `resulting_quantity` = new on-hand after decrement
+Every stock-changing operation follows this flow:
 
-### INTERNAL TRANSFER (DRAFT → DONE)
-- Both `source_location` and `destination_location` required
-- On DONE: **decrement** on-hand at source, **increment** on-hand at destination
-- `resulting_quantity` = new on-hand at destination
+```text
+BEGIN TRANSACTION
+  → Validate document status (must be READY/DRAFT depending on type)
+  → Validate all product/location references
+  → For each line:
+      → Read & lock current stock (FOR UPDATE)
+      → Validate quantity constraints (e.g., sufficient stock for deliveries)
+      → Modify stock (increase/decrease/adjust)
+      → Update StockMove row (status=DONE, resultingQuantity, validatedBy)
+  → COMMIT
+  (or ROLLBACK on any failure — no partial state)
+```
 
-### ADJUSTMENT (DRAFT → DONE)
-- `destination_location` required (the location being adjusted)
-- `reason` required
-- Quantity can be positive (add stock) or negative (remove stock)
-- On DONE: **add** quantity to `stock.quantity_on_hand` (signed)
-- `resulting_quantity` = new on-hand after adjustment
+### Atomicity Guarantee
 
----
+If *any* line in a multi-line document fails validation (e.g., line 3 of 5 has insufficient stock), the **entire transaction rolls back**. No lines are partially validated. The stock and StockMove rows remain unchanged.
 
-## Locking Strategy
+## Idempotency / Duplicate Protection
 
-### Stock Table
-Use `StockRepository.findByProductIdAndLocationIdForUpdate()` for ALL stock
-mutations. This acquires a `PESSIMISTIC_WRITE` lock ensuring no concurrent
-transaction can read-and-modify the same stock row.
+A `DONE` document cannot be re-validated. Calling `PATCH .../validate` on an already-completed document returns:
 
-### Sequence Counters
-Use `SequenceCounterRepository.findByWarehouseIdAndDirectionCodeForUpdate()`
-for reference number generation. Same pessimistic locking pattern.
+```json
+{
+  "success": false,
+  "code": "INVALID_STATE_TRANSITION",
+  "message": "Document is already validated (DONE). Cannot modify a completed document."
+}
+```
 
-### Optimistic Locking
-`Stock.version` provides a secondary safety net via `@Version`. If two
-transactions somehow bypass the pessimistic lock, the second commit will fail
-with `OptimisticLockException`.
+This is enforced server-side regardless of frontend button state.
 
----
+## State Transition Table
 
-## Document-Level Operations
+| Type       | Valid Transitions                                 | Cancel From              |
+|------------|---------------------------------------------------|--------------------------|
+| RECEIPT    | DRAFT → READY → DONE                             | DRAFT, READY → CANCELED  |
+| DELIVERY   | DRAFT → WAITING ↔ READY → DONE                  | DRAFT, WAITING, READY    |
+| INTERNAL   | DRAFT → DONE                                      | DRAFT → CANCELED         |
+| ADJUSTMENT | DRAFT → DONE (MANAGER only)                      | DRAFT → CANCELED         |
 
-All document-level actions operate on **every StockMove row sharing the same
-`documentId`** in a single transaction:
+**Always invalid:** DONE → anything, CANCELED → anything.
 
-| Action          | Applies To       | Effect                                    |
-|-----------------|------------------|-------------------------------------------|
-| validate (DONE) | All lines        | Update stock, set validatedBy, resultingQty|
-| cancel          | All lines        | Release reservations, set CANCELED        |
-| mark-ready      | Delivery lines   | Reserve stock, set READY                  |
-| check-availability | Delivery lines | Check free-to-use ≥ quantity per line     |
+## Negative Stock Policy
 
----
-
-## Reference Number Generation
-
-Backend Dev 2 calls `ReferenceGeneratorService.generate(type, warehouse)` once
-per document creation, then copies the returned reference + a fresh `UUID` to
-every `StockMove` row in that document.
-
-**Do NOT create a second numbering scheme.**
-
-Format: `{warehouse.code}/{direction}/{sequence}`
-Example: `WH/IN/0001`, `WH2/OUT/0012`
+`quantityOnHand >= 0` is enforced at the service layer. Any delivery or adjustment that would push stock negative is rejected with **409 INSUFFICIENT_STOCK**.
