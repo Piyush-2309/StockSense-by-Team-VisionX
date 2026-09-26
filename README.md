@@ -1,9 +1,13 @@
 # StockSense-by-Team-VisionX
 
 Problem Statement - StockSense Build a modular Inventory Management System (IMS) that digitizes and streamlines all stock-related operations within a business. 
-The goal is to replace manual registers, Excel sheets, and scattered tracking methods with a centralized, real-time, easy-to-use app. Target Users 
+The goal is to replace manual registers, Excel sheets, and scattered tracking methods with a centralized, real-time, easy-to-use app. 
+
+Target Users 
 • Inventory Managers – manage incoming & outgoing stock.
-• Warehouse Staff – perform transfers, picking, shelving, and counting. Authentication • The user signs up/logs in. • OTP-based password reset. • Redirected to Inventory Dashboard. Dashboard View The landing page shows a snapshot of inventory operations. Dashboard KPIs
+• Warehouse Staff – perform transfers, picking, shelving, and counting. Authentication • The user signs up/logs in. • OTP-based password reset. • Redirected to Inventory Dashboard.
+
+Dashboard View The landing page shows a snapshot of inventory operations. Dashboard KPIs
 • Total Products in Stock 
 • Low Stock / Out of Stock Items
 • Pending Receipts • Pending Deliveries
@@ -16,6 +20,8 @@ The goal is to replace manual registers, Excel sheets, and scattered tracking me
 4. Move History 
 5. Dashboard
 6. Setting • Warehouse
-7. Profile Menu (Left Sidebar) • My Profile • Logout Core Features1. Product Management • Create products with: ◦ Name ◦ SKU / Code ◦ Category ◦ Unit of Measure ◦ Initial stock (optional) 2. Receipts (Incoming Goods) Used when items arrive from vendors.
+7. Profile Menu (Left Sidebar)
+
+• My Profile • Logout Core Features1. Product Management • Create products with: ◦ Name ◦ SKU / Code ◦ Category ◦ Unit of Measure ◦ Initial stock (optional) 2. Receipts (Incoming Goods) Used when items arrive from vendors.
 Process: 1. Create a new receipt. 2. Add supplier & products. 3. Input quantities received. 4. Validate → stock increases automatically. Example: • Receive 50 units of “Steel Rods” → stock +50.3. Delivery Orders (Outgoing Goods) Used when stock leaves the warehouse for customer shipment.
 Process: 1. Pick items. 2. Pack items. 3. Validate → stock decreases automatically. Example: • Sales order for 10 chairs → Delivery order reduces chairs by 10. 4. Internal Transfers Move stock inside the company: Example: • Main Warehouse → Production Floor • Rack A → Rack B • Warehouse 1 → Warehouse 2 Each movement is logged in the ledger. 5. Stock Adjustments Fix mismatches between: 1. Recorded stock 2. Physical count Steps: • Select product/location • Enter counted quantity • System auto-updates and logs the ad
