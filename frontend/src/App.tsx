@@ -28,8 +28,13 @@ import { CategoriesView } from './views/CategoriesView';
 import { ReorderingRulesView } from './views/ReorderingRulesView';
 import { ProfileView } from './views/ProfileView';
 import { AuthView } from './views/AuthView';
+<<<<<<< HEAD
 import { Sparkles, Bot } from 'lucide-react';
 import { dashboardService, warehouseService } from './services/api';
+=======
+import { AuthProvider, useAuth } from './context/AuthContext';
+import { Sparkles, Bot, Layers } from 'lucide-react';
+>>>>>>> e5898a935da6d61920e1ab01dc90bd3dfb05bc54
 
 import type { RouteId } from './components/Sidebar';
 import type { WarehouseResponse, UserRole } from './types';
@@ -78,7 +83,12 @@ const AuthLoadingScreen: React.FC = () => (
 // ========================
 const MainApplication: React.FC = () => {
   const { showToast } = useToast();
+<<<<<<< HEAD
   const { user, logout } = useAuth();
+=======
+  const { user: authUser, isAuthenticated, isLoading: isAuthLoading, logout } = useAuth();
+  const [, setTick] = useState(0);
+>>>>>>> e5898a935da6d61920e1ab01dc90bd3dfb05bc54
 
   // Router & Entity State
   const [currentRoute, setCurrentRoute] = useState<RouteId>('dashboard');
@@ -154,10 +164,61 @@ const MainApplication: React.FC = () => {
     showToast('info', 'Signed Out', 'You have been signed out successfully.');
   };
 
+<<<<<<< HEAD
   // Build user object for topbar
   const topbarUser = user
     ? user
     : { id: 0, name: '', email: '', role: 'MANAGER' as UserRole };
+=======
+  // Live Metrics
+  const stats = inventoryEngine.getDashboardStats(selectedWarehouse);
+  const user = inventoryEngine.getUser();
+  const warehouses = inventoryEngine.getWarehouses();
+  const notifications = inventoryEngine.getNotifications();
+  const unreadNotifications = notifications.filter((n) => !n.isRead).length;
+
+  if (isAuthLoading) {
+    return (
+      <div
+        style={{
+          minHeight: '100vh',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          background: '#0B0F19',
+          color: '#FFFFFF',
+          fontFamily: 'Inter, system-ui, sans-serif',
+        }}
+      >
+        <div style={{ textAlign: 'center' }}>
+          <div
+            style={{
+              width: 64,
+              height: 64,
+              borderRadius: 18,
+              background: 'linear-gradient(135deg, #7C3AED 0%, #4C1D95 100%)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              margin: '0 auto 20px',
+              boxShadow: '0 8px 30px rgba(124, 58, 237, 0.5)',
+            }}
+          >
+            <Layers size={32} color="#FFFFFF" />
+          </div>
+          <h2 style={{ fontSize: 22, fontWeight: 700, letterSpacing: '-0.02em' }}>StockSense</h2>
+          <p style={{ color: '#94A3B8', fontSize: 13.5, marginTop: 6 }}>
+            Connecting to inventory engine & validating session...
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!isAuthenticated || currentRoute === 'login') {
+    return <AuthView onLoginSuccess={() => setCurrentRoute('dashboard')} />;
+  }
+>>>>>>> e5898a935da6d61920e1ab01dc90bd3dfb05bc54
 
   return (
     <div className="app-container">
@@ -178,15 +239,42 @@ const MainApplication: React.FC = () => {
           warehouses={warehouses}
           selectedWarehouse={selectedWarehouse}
           onSelectWarehouse={setSelectedWarehouse}
+<<<<<<< HEAD
           user={topbarUser}
           unreadNotificationsCount={0}
+=======
+          user={
+            authUser
+              ? {
+                  id: authUser.id,
+                  name: authUser.name,
+                  email: authUser.email,
+                  role: authUser.role,
+                  avatar: authUser.name
+                    .split(' ')
+                    .map((s) => s[0])
+                    .join('')
+                    .substring(0, 2)
+                    .toUpperCase(),
+                }
+              : user
+          }
+          unreadNotificationsCount={unreadNotifications}
+>>>>>>> e5898a935da6d61920e1ab01dc90bd3dfb05bc54
           onOpenNotifications={() => setIsNotificationsOpen(true)}
           onOpenSearch={() => setIsSearchOpen(true)}
           onOpenAi={() => setIsAiOpen(true)}
           onOpenGoldenDemo={() => setIsGoldenDemoOpen(true)}
           onResetData={() => {}}
           onNavigate={handleNavigate}
+<<<<<<< HEAD
           onLogout={handleLogout}
+=======
+          onLogout={async () => {
+            await logout();
+            setCurrentRoute('login');
+          }}
+>>>>>>> e5898a935da6d61920e1ab01dc90bd3dfb05bc54
         />
 
         {/* Dynamic Route View */}
@@ -435,11 +523,19 @@ const AppRouter: React.FC = () => {
 
 export function App() {
   return (
+<<<<<<< HEAD
     <AuthProvider>
       <ToastProvider>
         <AppRouter />
       </ToastProvider>
     </AuthProvider>
+=======
+    <ToastProvider>
+      <AuthProvider>
+        <MainApplication />
+      </AuthProvider>
+    </ToastProvider>
+>>>>>>> e5898a935da6d61920e1ab01dc90bd3dfb05bc54
   );
 }
 

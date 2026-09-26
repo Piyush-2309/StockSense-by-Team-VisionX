@@ -51,4 +51,23 @@ public class AuthController {
         authService.resetPassword(request);
         return ResponseEntity.ok(ApiResponse.success("Password reset successfully."));
     }
+
+    @GetMapping("/me")
+    public ResponseEntity<ApiResponse<UserResponse>> getCurrentUser(
+            @org.springframework.security.core.annotation.AuthenticationPrincipal com.stocksense.security.CustomUserDetails userDetails) {
+        if (userDetails == null) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                    .body(ApiResponse.<UserResponse>error("UNAUTHORIZED", "Not authenticated", "/api/v1/auth/me"));
+        }
+        UserResponse response = authService.getUserProfile(userDetails.getUserId());
+        return ResponseEntity.ok(ApiResponse.success(response));
+    }
+
+    @PostMapping("/logout")
+    public ResponseEntity<ApiResponse<String>> logout(@RequestBody(required = false) RefreshTokenRequest request) {
+        if (request != null && request.getRefreshToken() != null) {
+            authService.logout(request.getRefreshToken());
+        }
+        return ResponseEntity.ok(ApiResponse.success("Logged out successfully."));
+    }
 }

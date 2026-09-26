@@ -409,9 +409,17 @@ export const Topbar: React.FC<TopbarProps> = ({
 
               <div
                 onClick={() => {
+<<<<<<< HEAD
                   if (onLogout) onLogout();
                   else onNavigate('login');
+=======
+>>>>>>> e5898a935da6d61920e1ab01dc90bd3dfb05bc54
                   setShowProfileMenu(false);
+                  if (onLogout) {
+                    onLogout();
+                  } else {
+                    onNavigate('login');
+                  }
                 }}
                 style={{
                   display: 'flex',

@@ -59,8 +59,8 @@ public class ApiResponse<T> {
                 .build();
     }
 
-    public static ApiResponse<Void> error(String code, String message, String path) {
-        return ApiResponse.<Void>builder()
+    public static <T> ApiResponse<T> error(String code, String message, String path) {
+        return ApiResponse.<T>builder()
                 .success(false)
                 .code(code)
                 .message(message)
@@ -69,8 +69,8 @@ public class ApiResponse<T> {
                 .build();
     }
 
-    public static ApiResponse<Void> error(String code, String message, Map<String, String> errors, String path) {
-        return ApiResponse.<Void>builder()
+    public static <T> ApiResponse<T> error(String code, String message, Map<String, String> errors, String path) {
+        return ApiResponse.<T>builder()
                 .success(false)
                 .code(code)
                 .message(message)

@@ -23,6 +23,10 @@ target/
 *.jar
 *.war
 .mvn/wrapper/maven-wrapper.jar
+backend/data/
+**/data/*.db
+*.mv.db
+*.trace.db
 
 # Editor directories and files
 .vscode/*

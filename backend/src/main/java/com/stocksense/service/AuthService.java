@@ -163,4 +163,31 @@ public class AuthService {
 
         log.info("Password reset for user: {}", user.getEmail());
     }
+
+    /**
+     * Get profile of currently authenticated user.
+     */
+    @Transactional(readOnly = true)
+    public UserResponse getUserProfile(Long userId) {
+        User user = userRepository.findById(userId)
+                .orElseThrow(() -> new ResourceNotFoundException("User", "id", userId));
+        return UserResponse.builder()
+                .id(user.getId())
+                .name(user.getName())
+                .email(user.getEmail())
+                .role(user.getRole().name())
+                .active(user.getActive())
+                .build();
+    }
+
+    /**
+     * Revoke refresh token on logout.
+     */
+    @Transactional
+    public void logout(String refreshTokenStr) {
+        if (refreshTokenStr != null && !refreshTokenStr.isBlank()) {
+            refreshTokenService.findByToken(refreshTokenStr)
+                    .ifPresent(refreshTokenService::revokeToken);
+        }
+    }
 }
