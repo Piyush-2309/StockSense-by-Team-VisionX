@@ -70,4 +70,24 @@ public interface StockMoveRepository extends JpaRepository<StockMove, Long> {
      * Check if a reference already exists (defensive).
      */
     boolean existsByReference(String reference);
+
+    /**
+     * All distinct document IDs, ordered by most recent first.
+     * Used by the ledger view when no type filter is applied.
+     */
+    @Query("SELECT DISTINCT sm.documentId FROM StockMove sm ORDER BY sm.documentId DESC")
+    Page<UUID> findAllDistinctDocumentIds(Pageable pageable);
+
+    /**
+     * Count pending documents (not DONE and not CANCELED) by type.
+     */
+    @Query("SELECT COUNT(DISTINCT sm.documentId) FROM StockMove sm WHERE sm.type = :type AND sm.status NOT IN :excludedStatuses")
+    Long countPendingDocumentsByType(@Param("type") OperationType type,
+                                     @Param("excludedStatuses") List<MoveStatus> excludedStatuses);
+
+    /**
+     * Recent DONE document IDs for dashboard.
+     */
+    @Query("SELECT DISTINCT sm.documentId FROM StockMove sm WHERE sm.status = :status ORDER BY sm.documentId DESC")
+    Page<UUID> findRecentDoneDocumentIds(@Param("status") MoveStatus status, Pageable pageable);
 }
