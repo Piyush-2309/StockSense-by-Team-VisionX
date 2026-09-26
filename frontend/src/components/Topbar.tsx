@@ -25,6 +25,7 @@ interface TopbarProps {
   onOpenGoldenDemo: () => void;
   onResetData: () => void;
   onNavigate: (route: any) => void;
+  onLogout?: () => void;
 }
 
 export const Topbar: React.FC<TopbarProps> = ({
@@ -39,6 +40,7 @@ export const Topbar: React.FC<TopbarProps> = ({
   onOpenGoldenDemo,
   onResetData,
   onNavigate,
+  onLogout,
 }) => {
   const [showProfileMenu, setShowProfileMenu] = useState(false);
   const [showWarehouseMenu, setShowWarehouseMenu] = useState(false);
@@ -407,8 +409,12 @@ export const Topbar: React.FC<TopbarProps> = ({
 
               <div
                 onClick={() => {
-                  onNavigate('login');
                   setShowProfileMenu(false);
+                  if (onLogout) {
+                    onLogout();
+                  } else {
+                    onNavigate('login');
+                  }
                 }}
                 style={{
                   display: 'flex',

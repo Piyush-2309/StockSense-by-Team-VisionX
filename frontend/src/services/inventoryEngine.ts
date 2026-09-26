@@ -15,6 +15,10 @@ import {
   User,
   DashboardStats,
   ProductStatus,
+  AdjustmentReason,
+  ReceiptItem,
+  DeliveryItem,
+  TransferItem,
 } from '../types';
 
 import {
@@ -33,6 +37,9 @@ import {
   initialReorderRules,
   initialNotifications,
 } from '../data/initialData';
+
+import { backendApi, BackendDocument, BackendProduct, BackendStock } from './backendApi';
+import { apiClient } from './apiClient';
 
 const STORAGE_KEY = 'stocksense_state_v1';
 
@@ -58,9 +65,14 @@ type Listener = () => void;
 class InventoryEngine {
   private state: InventoryState;
   private listeners: Set<Listener> = new Set();
+  private isSyncing = false;
 
   constructor() {
     this.state = this.loadState();
+    // Automatically trigger initial backend synchronization
+    this.syncWithBackend().catch(() => {
+      // Offline fallback already initialized from storage
+    });
   }
 
   private loadState(): InventoryState {
@@ -70,7 +82,7 @@ class InventoryEngine {
         return JSON.parse(saved);
       }
     } catch {
-      // fallback to initial
+      // fallback
     }
     return this.getInitialState();
   }
@@ -98,7 +110,7 @@ class InventoryEngine {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(this.state));
     } catch {
-      // Storage unavailable or quota exceeded
+      // ignore
     }
     this.notify();
   }
@@ -125,7 +137,295 @@ class InventoryEngine {
     this.persist();
   }
 
-  // --- GETTERS ---
+  // ==========================================
+  // AUTHORITATIVE BACKEND SYNCHRONIZATION
+  // ==========================================
+
+  public async syncWithBackend(): Promise<void> {
+    if (this.isSyncing) return;
+    this.isSyncing = true;
+
+    try {
+      // 1. Fetch metadata in parallel
+      const [backendWarehouses, backendLocations, backendCategories] = await Promise.all([
+        backendApi.warehouses.list().catch(() => null),
+        backendApi.locations.list().catch(() => null),
+        backendApi.categories.list().catch(() => null),
+      ]);
+
+      if (backendWarehouses && backendWarehouses.length > 0) {
+        this.state.warehouses = backendWarehouses.map((w) => ({
+          id: w.id.toString(),
+          code: w.code,
+          name: w.name,
+          address: w.address || '',
+          locationCount: 3,
+          status: w.active ? 'Active' : 'Inactive',
+        }));
+      }
+
+      if (backendLocations && backendLocations.length > 0) {
+        this.state.locations = backendLocations.map((l) => ({
+          id: l.id.toString(),
+          warehouseId: l.warehouseId.toString(),
+          warehouseName: l.warehouseName,
+          code: l.code,
+          name: l.name,
+          type: l.name.includes('Production') ? 'Production' : 'Internal',
+          parentLocationId: l.parentLocationId?.toString(),
+          status: l.active ? 'Active' : 'Inactive',
+        }));
+      }
+
+      if (backendCategories && backendCategories.length > 0) {
+        this.state.categories = backendCategories.map((c) => ({
+          id: c.id.toString(),
+          name: c.name,
+          code: c.name.substring(0, 4).toUpperCase(),
+          description: c.description || '',
+          productCount: 0,
+        }));
+      }
+
+      // 2. Fetch products and stock quants
+      const [backendProductsRes, backendStock] = await Promise.all([
+        backendApi.products.list({ size: 100 }).catch(() => null),
+        backendApi.stock.getAll().catch(() => null),
+      ]);
+
+      if (backendProductsRes && backendProductsRes.content) {
+        this.state.products = backendProductsRes.content.map((p) => {
+          const totalStock = p.totalStock ?? 0;
+          return {
+            id: p.id.toString(),
+            name: p.name,
+            sku: p.sku,
+            categoryId: p.categoryId?.toString() || '1',
+            categoryName: p.categoryName || 'Raw Materials',
+            uom: p.unitOfMeasure,
+            totalStock,
+            availableStock: totalStock,
+            reservedStock: 0,
+            reorderLevel: p.reorderLevel ?? 50,
+            targetLevel: (p.reorderLevel ?? 50) * 2.5,
+            status: this.mapBackendStatusToUi(p.stockStatus, totalStock, p.reorderLevel),
+            isActive: p.active,
+          };
+        });
+      }
+
+      if (backendStock && backendStock.length > 0) {
+        this.state.quants = backendStock.map((s) => ({
+          id: s.id.toString(),
+          productId: s.productId.toString(),
+          warehouseId: s.warehouseId.toString(),
+          locationId: s.locationId.toString(),
+          quantity: s.quantityOnHand,
+          reservedQuantity: s.quantityReserved || 0,
+        }));
+
+        // Reconcile available and reserved stock on products
+        this.state.products.forEach((p) => {
+          const pQuants = this.state.quants.filter((q) => q.productId === p.id);
+          const total = pQuants.reduce((sum, q) => sum + q.quantity, 0);
+          const reserved = pQuants.reduce((sum, q) => sum + q.reservedQuantity, 0);
+          p.totalStock = total;
+          p.availableStock = Math.max(0, total - reserved);
+          p.reservedStock = reserved;
+          p.status = this.recalculateProductStatus(p);
+        });
+      }
+
+      // 3. Fetch Operations & Ledger
+      const [receiptsRes, deliveriesRes, transfersRes, adjustmentsRes, movesRes] =
+        await Promise.all([
+          backendApi.receipts.list('all', 0, 50).catch(() => null),
+          backendApi.deliveries.list('all', 0, 50).catch(() => null),
+          backendApi.transfers.list('all', 0, 50).catch(() => null),
+          backendApi.adjustments.list('all', 0, 50).catch(() => null),
+          backendApi.moves.list({ size: 100 }).catch(() => null),
+        ]);
+
+      if (receiptsRes && receiptsRes.content) {
+        this.state.receipts = receiptsRes.content.map((doc) => this.mapDocToReceipt(doc));
+      }
+
+      if (deliveriesRes && deliveriesRes.content) {
+        this.state.deliveries = deliveriesRes.content.map((doc) => this.mapDocToDelivery(doc));
+      }
+
+      if (transfersRes && transfersRes.content) {
+        this.state.transfers = transfersRes.content.map((doc) => this.mapDocToTransfer(doc));
+      }
+
+      if (adjustmentsRes && adjustmentsRes.content) {
+        this.state.adjustments = adjustmentsRes.content.map((doc) => this.mapDocToAdjustment(doc));
+      }
+
+      if (movesRes && movesRes.content) {
+        this.state.ledger = movesRes.content.map((doc) => this.mapDocToLedger(doc));
+      }
+
+      this.persist();
+    } catch (err) {
+      console.warn('Backend sync failed, operating with active memory store:', err);
+    } finally {
+      this.isSyncing = false;
+    }
+  }
+
+  // --- Document Mappers ---
+
+  private mapBackendStatusToUi(rawStatus: string, stock: number, min: number): ProductStatus {
+    if (stock <= 0) return 'Out of Stock';
+    if (stock < min * 0.7) return 'Below Minimum';
+    if (stock <= min) return 'Low Stock';
+    return 'In Stock';
+  }
+
+  private mapDocToReceipt(doc: BackendDocument): Receipt {
+    return {
+      id: doc.documentId,
+      reference: doc.reference,
+      supplier: doc.partnerName || 'Vendor Supplier',
+      warehouseId: doc.destinationWarehouseId?.toString() || '1',
+      locationId: doc.destinationLocationId?.toString() || '1',
+      warehouseName: doc.destinationWarehouseName || 'Main Warehouse',
+      locationName: doc.destinationLocationName || 'Rack A',
+      status: doc.status === 'DONE' ? 'Done' : doc.status === 'READY' ? 'Ready' : doc.status === 'CANCELED' ? 'Cancelled' : 'Draft',
+      date: doc.createdAt ? new Date(doc.createdAt).toLocaleDateString() : 'Today',
+      notes: doc.notes || doc.reason,
+      items: (doc.lines || []).map((l) => ({
+        id: l.id.toString(),
+        productId: l.productId.toString(),
+        productName: l.productName,
+        sku: l.sku,
+        uom: l.unitOfMeasure,
+        orderedQty: l.quantity,
+        receivedQty: doc.status === 'DONE' ? l.quantity : 0,
+      })),
+    };
+  }
+
+  private mapDocToDelivery(doc: BackendDocument): Delivery {
+    return {
+      id: doc.documentId,
+      reference: doc.reference,
+      customer: doc.partnerName || 'Customer Client',
+      warehouseId: doc.sourceWarehouseId?.toString() || '1',
+      locationId: doc.sourceLocationId?.toString() || '1',
+      warehouseName: doc.sourceWarehouseName || 'Main Warehouse',
+      locationName: doc.sourceLocationName || 'Rack A',
+      status: doc.status === 'DONE' ? 'Done' : doc.status === 'READY' ? 'Ready' : doc.status === 'WAITING' ? 'Picked' : doc.status === 'CANCELED' ? 'Cancelled' : 'Draft',
+      date: doc.createdAt ? new Date(doc.createdAt).toLocaleDateString() : 'Today',
+      notes: doc.notes || doc.reason,
+      items: (doc.lines || []).map((l) => ({
+        id: l.id.toString(),
+        productId: l.productId.toString(),
+        productName: l.productName,
+        sku: l.sku,
+        uom: l.unitOfMeasure,
+        availableQty: 100,
+        requestedQty: l.quantity,
+        deliveredQty: doc.status === 'DONE' ? l.quantity : 0,
+      })),
+    };
+  }
+
+  private mapDocToTransfer(doc: BackendDocument): InternalTransfer {
+    const line = doc.lines?.[0];
+    return {
+      id: doc.documentId,
+      reference: doc.reference,
+      status: doc.status === 'DONE' ? 'Done' : 'Draft',
+      date: doc.createdAt ? new Date(doc.createdAt).toLocaleDateString() : 'Today',
+      sourceWarehouseId: doc.sourceWarehouseId?.toString() || '1',
+      sourceWarehouseName: doc.sourceWarehouseName || 'Main Warehouse',
+      sourceLocationId: doc.sourceLocationId?.toString() || '1',
+      sourceLocationName: doc.sourceLocationName || 'Rack A',
+      destWarehouseId: doc.destinationWarehouseId?.toString() || '1',
+      destWarehouseName: doc.destinationWarehouseName || 'Main Warehouse',
+      destLocationId: doc.destinationLocationId?.toString() || '4',
+      destLocationName: doc.destinationLocationName || 'Rack P1',
+      notes: doc.notes || doc.reason,
+      items: (doc.lines || []).map((l) => ({
+        id: l.id.toString(),
+        productId: l.productId.toString(),
+        productName: l.productName,
+        sku: l.sku,
+        uom: l.unitOfMeasure,
+        availableQty: l.quantity,
+        quantity: l.quantity,
+      })),
+    };
+  }
+
+  private mapDocToAdjustment(doc: BackendDocument): Adjustment {
+    const line = doc.lines?.[0];
+    const rawReason = doc.reason || 'Counting Error';
+    const validReason: AdjustmentReason =
+      rawReason === 'Damaged' || rawReason === 'Missing' || rawReason === 'Misplaced' || rawReason === 'Counting Error'
+        ? rawReason
+        : 'Other';
+
+    return {
+      id: doc.documentId,
+      reference: doc.reference,
+      productId: line?.productId.toString() || '1',
+      productName: line?.productName || 'Adjusted Item',
+      sku: line?.sku || 'ADJ-SKU',
+      uom: line?.unitOfMeasure || 'pcs',
+      warehouseId: doc.sourceWarehouseId?.toString() || '1',
+      locationId: doc.sourceLocationId?.toString() || '1',
+      locationName: doc.sourceLocationName || 'Rack A',
+      systemQuantity: (line?.resultingQuantity || 0) - (line?.quantity || 0),
+      physicalCount: line?.resultingQuantity || 0,
+      variance: line?.quantity || 0,
+      reason: validReason,
+      status: doc.status === 'DONE' ? 'Applied' : 'Draft',
+      date: doc.createdAt ? new Date(doc.createdAt).toLocaleDateString() : 'Today',
+    };
+  }
+
+  private mapDocToLedger(doc: BackendDocument): StockLedgerEntry {
+    const line = doc.lines?.[0];
+    let type: StockLedgerEntry['type'] = 'Receipt';
+    let impact: 'IN' | 'OUT' | 'INTERNAL' = 'IN';
+
+    if (doc.type === 'DELIVERY') {
+      type = 'Delivery';
+      impact = 'OUT';
+    } else if (doc.type === 'INTERNAL') {
+      type = 'Internal Transfer';
+      impact = 'INTERNAL';
+    } else if (doc.type === 'ADJUSTMENT') {
+      type = 'Adjustment';
+      impact = (line?.quantity || 0) >= 0 ? 'IN' : 'OUT';
+    }
+
+    return {
+      id: doc.documentId,
+      reference: doc.reference,
+      type,
+      impact,
+      productId: line?.productId.toString() || '1',
+      productName: line?.productName || 'Product',
+      sku: line?.sku || 'SKU',
+      quantity: Math.abs(line?.quantity || 0),
+      uom: line?.unitOfMeasure || 'pcs',
+      fromLocation: doc.sourceLocationName || 'Vendor Location',
+      toLocation: doc.destinationLocationName || 'Warehouse Rack',
+      user: doc.userName || 'Admin Manager',
+      status: 'Done',
+      timestamp: doc.createdAt ? new Date(doc.createdAt).toLocaleString() : 'Just now',
+      balanceAfter: line?.resultingQuantity ?? 100,
+    };
+  }
+
+  // ==========================================
+  // PUBLIC GETTERS
+  // ==========================================
+
   public getState(): InventoryState {
     return this.state;
   }
@@ -216,7 +516,8 @@ class InventoryEngine {
     this.persist();
   }
 
-  // --- COMPUTATIONS & DASHBOARD STATS ---
+  // --- STATS & COMPUTATIONS ---
+
   public getDashboardStats(warehouseFilter?: string): DashboardStats {
     let quants = this.state.quants;
     if (warehouseFilter && warehouseFilter !== 'all') {
@@ -252,31 +553,36 @@ class InventoryEngine {
 
   public getStockByLocationBreakdown() {
     const warehouseTotals: Record<string, { name: string; quantity: number; color: string }> = {
+      '1': { name: 'Main Warehouse', quantity: 0, color: '#6D28D9' },
+      '2': { name: 'Warehouse 2', quantity: 0, color: '#10B981' },
       'wh-main': { name: 'Main Warehouse', quantity: 0, color: '#6D28D9' },
-      'wh-prod': { name: 'Production', quantity: 0, color: '#3B82F6' },
       'wh-2': { name: 'Warehouse 2', quantity: 0, color: '#10B981' },
-      'other': { name: 'Other', quantity: 0, color: '#94A3B8' },
     };
 
     this.state.quants.forEach((q) => {
       if (warehouseTotals[q.warehouseId]) {
         warehouseTotals[q.warehouseId].quantity += q.quantity;
-      } else {
-        warehouseTotals['other'].quantity += q.quantity;
       }
     });
 
-    const total = Object.values(warehouseTotals).reduce((sum, item) => sum + item.quantity, 0);
-
-    return {
-      total,
-      breakdown: Object.entries(warehouseTotals).map(([id, data]) => ({
+    const breakdown = Object.entries(warehouseTotals)
+      .filter(([id]) => id === '1' || id === '2')
+      .map(([id, data]) => ({
         id,
         name: data.name,
         quantity: data.quantity,
-        percentage: total > 0 ? Math.round((data.quantity / total) * 100) : 0,
+        percentage: 0,
         color: data.color,
-      })),
+      }));
+
+    const total = breakdown.reduce((sum, item) => sum + item.quantity, 0);
+    breakdown.forEach((b) => {
+      b.percentage = total > 0 ? Math.round((b.quantity / total) * 100) : 0;
+    });
+
+    return {
+      total,
+      breakdown,
     };
   }
 
@@ -290,544 +596,24 @@ class InventoryEngine {
     if (product.totalStock <= product.reorderLevel) {
       return 'Low Stock';
     }
-    if (product.id === 'prod-plastic-sheets') {
-      return 'High Consumption';
-    }
     return 'In Stock';
   }
 
-  private updateProductStock(productId: string) {
-    const product = this.state.products.find((p) => p.id === productId);
-    if (!product) return;
-
-    const productQuants = this.state.quants.filter((q) => q.productId === productId);
-    const total = productQuants.reduce((sum, q) => sum + q.quantity, 0);
-    const reserved = productQuants.reduce((sum, q) => sum + q.reservedQuantity, 0);
-
-    product.totalStock = Math.max(0, total);
-    product.reservedStock = reserved;
-    product.availableStock = Math.max(0, total - reserved);
-    product.status = this.recalculateProductStatus(product);
-
-    // Sync notification if out of stock or low stock
-    if (product.totalStock <= 0) {
-      this.addOrUpdateNotification({
-        id: `notif-out-${product.id}`,
-        title: 'Out of Stock Warning',
-        message: `${product.name} (${product.sku}) is completely exhausted (0 ${product.uom} remaining).`,
-        type: 'out_of_stock',
-        link: `/products/${product.id}`,
-        isRead: false,
-        timestamp: 'Just now',
-      });
-    }
-  }
-
-  private addOrUpdateNotification(notification: Notification) {
-    const existingIndex = this.state.notifications.findIndex((n) => n.id === notification.id);
-    if (existingIndex >= 0) {
-      this.state.notifications[existingIndex] = notification;
-    } else {
-      this.state.notifications.unshift(notification);
-    }
-  }
-
-  // --- INVENTORY OPERATIONS ---
-
-  // 1. RECEIPT
-  public createReceipt(data: {
-    supplier: string;
-    warehouseId: string;
-    locationId: string;
-    items: Array<{ productId: string; orderedQty: number }>;
-    notes?: string;
-  }): { success: boolean; receipt?: Receipt; error?: string } {
-    const warehouse = this.state.warehouses.find((w) => w.id === data.warehouseId);
-    const location = this.state.locations.find((l) => l.id === data.locationId);
-    if (!warehouse || !location) {
-      return { success: false, error: 'Invalid destination warehouse or location' };
-    }
-
-    const receiptNumber = 40 + this.state.receipts.length + 1;
-    const reference = `RC-00${receiptNumber}`;
-
-    const items = data.items.map((item, idx) => {
-      const prod = this.state.products.find((p) => p.id === item.productId);
-      return {
-        id: `ri-${Date.now()}-${idx}`,
-        productId: item.productId,
-        productName: prod ? prod.name : 'Unknown Product',
-        sku: prod ? prod.sku : 'SKU-UNKNOWN',
-        uom: prod ? prod.uom : 'units',
-        orderedQty: item.orderedQty,
-        receivedQty: item.orderedQty,
-      };
-    });
-
-    const newReceipt: Receipt = {
-      id: `rc-${Date.now()}`,
-      reference,
-      supplier: data.supplier,
-      warehouseId: data.warehouseId,
-      warehouseName: warehouse.name,
-      locationId: data.locationId,
-      locationName: location.name,
-      items,
-      status: 'Ready',
-      date: new Date().toLocaleDateString('en-US', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }),
-      notes: data.notes || 'Incoming stock receipt order',
-    };
-
-    this.state.receipts.unshift(newReceipt);
-    this.persist();
-    return { success: true, receipt: newReceipt };
-  }
-
-  public validateReceipt(receiptId: string): { success: boolean; message?: string; addedQuantity?: number; error?: string } {
-    const receipt = this.state.receipts.find((r) => r.id === receiptId || r.reference === receiptId);
-    if (!receipt) {
-      return { success: false, error: 'Receipt not found' };
-    }
-
-    if (receipt.status === 'Done') {
-      return { success: false, error: 'Receipt has already been validated and processed.' };
-    }
-    if (receipt.status === 'Cancelled') {
-      return { success: false, error: 'Cannot validate a cancelled receipt.' };
-    }
-
-    let totalQuantityAdded = 0;
-
-    receipt.items.forEach((item) => {
-      const qtyToAdd = item.receivedQty > 0 ? item.receivedQty : item.orderedQty;
-      totalQuantityAdded += qtyToAdd;
-
-      // Locate quant or create
-      let quant = this.state.quants.find(
-        (q) => q.productId === item.productId && q.locationId === receipt.locationId
-      );
-
-      if (!quant) {
-        quant = {
-          id: `sq-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
-          productId: item.productId,
-          warehouseId: receipt.warehouseId,
-          locationId: receipt.locationId,
-          quantity: 0,
-          reservedQuantity: 0,
-        };
-        this.state.quants.push(quant);
-      }
-
-      quant.quantity += qtyToAdd;
-      this.updateProductStock(item.productId);
-
-      // Create Ledger entry
-      const ledgerEntry: StockLedgerEntry = {
-        id: `mov-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
-        reference: receipt.reference,
-        timestamp: new Date().toLocaleDateString('en-US', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }),
-        type: 'Receipt',
-        productId: item.productId,
-        productName: item.productName,
-        sku: item.sku,
-        fromLocation: `Vendor (${receipt.supplier})`,
-        toLocation: `${receipt.warehouseName} / ${receipt.locationName}`,
-        quantity: qtyToAdd,
-        uom: item.uom,
-        user: this.state.user.name,
-        status: 'Done',
-        notes: `Validated receipt ${receipt.reference}`,
-      };
-
-      this.state.ledger.unshift(ledgerEntry);
-    });
-
-    receipt.status = 'Done';
-    this.persist();
-
-    return {
-      success: true,
-      message: `Receipt ${receipt.reference} validated. +${totalQuantityAdded} added to inventory.`,
-      addedQuantity: totalQuantityAdded,
-    };
-  }
-
-  // 2. DELIVERY
-  public createDelivery(data: {
-    customer: string;
-    warehouseId: string;
-    locationId: string;
-    items: Array<{ productId: string; requestedQty: number }>;
-    notes?: string;
-  }): { success: boolean; delivery?: Delivery; error?: string } {
-    const warehouse = this.state.warehouses.find((w) => w.id === data.warehouseId);
-    const location = this.state.locations.find((l) => l.id === data.locationId);
-    if (!warehouse || !location) {
-      return { success: false, error: 'Invalid source warehouse or location' };
-    }
-
-    // Check available stock for each item
-    for (const item of data.items) {
-      const quant = this.state.quants.find(
-        (q) => q.productId === item.productId && q.locationId === data.locationId
-      );
-      const available = quant ? Math.max(0, quant.quantity - quant.reservedQuantity) : 0;
-      if (item.requestedQty > available) {
-        const prod = this.state.products.find((p) => p.id === item.productId);
-        return {
-          success: false,
-          error: `Insufficient stock for ${prod?.name || 'product'}. Available: ${available} ${prod?.uom || ''}. Requested: ${item.requestedQty} ${prod?.uom || ''}.`,
-        };
-      }
-    }
-
-    const deliveryNumber = 28 + this.state.deliveries.length + 1;
-    const reference = `DO-00${deliveryNumber}`;
-
-    const items = data.items.map((item, idx) => {
-      const prod = this.state.products.find((p) => p.id === item.productId);
-      const quant = this.state.quants.find(
-        (q) => q.productId === item.productId && q.locationId === data.locationId
-      );
-      const available = quant ? Math.max(0, quant.quantity - quant.reservedQuantity) : 0;
-
-      // Reserve stock
-      if (quant) {
-        quant.reservedQuantity += item.requestedQty;
-      }
-
-      return {
-        id: `di-${Date.now()}-${idx}`,
-        productId: item.productId,
-        productName: prod ? prod.name : 'Unknown Product',
-        sku: prod ? prod.sku : 'SKU-UNKNOWN',
-        uom: prod ? prod.uom : 'units',
-        availableQty: available,
-        requestedQty: item.requestedQty,
-        deliveredQty: item.requestedQty,
-      };
-    });
-
-    const newDelivery: Delivery = {
-      id: `do-${Date.now()}`,
-      reference,
-      customer: data.customer,
-      warehouseId: data.warehouseId,
-      warehouseName: warehouse.name,
-      locationId: data.locationId,
-      locationName: location.name,
-      items,
-      status: 'Ready',
-      date: new Date().toLocaleDateString('en-US', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }),
-      notes: data.notes || 'Customer dispatch order',
-    };
-
-    this.state.deliveries.unshift(newDelivery);
-    data.items.forEach((item) => this.updateProductStock(item.productId));
-    this.persist();
-
-    return { success: true, delivery: newDelivery };
-  }
-
-  public validateDelivery(deliveryId: string): { success: boolean; message?: string; deliveredQuantity?: number; error?: string } {
-    const delivery = this.state.deliveries.find((d) => d.id === deliveryId || d.reference === deliveryId);
-    if (!delivery) {
-      return { success: false, error: 'Delivery order not found' };
-    }
-    if (delivery.status === 'Done') {
-      return { success: false, error: 'Delivery order has already been validated and delivered.' };
-    }
-    if (delivery.status === 'Cancelled') {
-      return { success: false, error: 'Cannot validate a cancelled delivery order.' };
-    }
-
-    // Verify stock availability
-    for (const item of delivery.items) {
-      const quant = this.state.quants.find(
-        (q) => q.productId === item.productId && q.locationId === delivery.locationId
-      );
-      if (!quant || quant.quantity < item.deliveredQty) {
-        return {
-          success: false,
-          error: `Insufficient stock in ${delivery.locationName}. Available: ${quant?.quantity || 0} ${item.uom}. Requested: ${item.deliveredQty} ${item.uom}.`,
-        };
-      }
-    }
-
-    let totalDelivered = 0;
-
-    delivery.items.forEach((item) => {
-      const quant = this.state.quants.find(
-        (q) => q.productId === item.productId && q.locationId === delivery.locationId
-      );
-      if (quant) {
-        quant.quantity = Math.max(0, quant.quantity - item.deliveredQty);
-        quant.reservedQuantity = Math.max(0, quant.reservedQuantity - item.deliveredQty);
-      }
-
-      totalDelivered += item.deliveredQty;
-      this.updateProductStock(item.productId);
-
-      // Ledger Entry
-      const ledgerEntry: StockLedgerEntry = {
-        id: `mov-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
-        reference: delivery.reference,
-        timestamp: new Date().toLocaleDateString('en-US', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }),
-        type: 'Delivery',
-        productId: item.productId,
-        productName: item.productName,
-        sku: item.sku,
-        fromLocation: `${delivery.warehouseName} / ${delivery.locationName}`,
-        toLocation: `Customer (${delivery.customer})`,
-        quantity: -item.deliveredQty,
-        uom: item.uom,
-        user: this.state.user.name,
-        status: 'Done',
-        notes: `Validated customer delivery ${delivery.reference}`,
-      };
-
-      this.state.ledger.unshift(ledgerEntry);
-    });
-
-    delivery.status = 'Done';
-    this.persist();
-
-    return {
-      success: true,
-      message: `Delivery ${delivery.reference} validated. -${totalDelivered} dispatched from warehouse.`,
-      deliveredQuantity: totalDelivered,
-    };
-  }
-
-  // 3. INTERNAL TRANSFER
-  public createAndExecuteTransfer(data: {
-    sourceWarehouseId: string;
-    sourceLocationId: string;
-    destWarehouseId: string;
-    destLocationId: string;
-    productId: string;
-    quantity: number;
-    notes?: string;
-  }): { success: boolean; transfer?: InternalTransfer; message?: string; error?: string } {
-    if (data.sourceLocationId === data.destLocationId) {
-      return { success: false, error: 'Source and destination locations cannot be identical.' };
-    }
-    if (data.quantity <= 0) {
-      return { success: false, error: 'Transfer quantity must be greater than zero.' };
-    }
-
-    const sourceQuant = this.state.quants.find(
-      (q) => q.productId === data.productId && q.locationId === data.sourceLocationId
-    );
-    const available = sourceQuant ? sourceQuant.quantity - sourceQuant.reservedQuantity : 0;
-
-    if (!sourceQuant || available < data.quantity) {
-      const prod = this.state.products.find((p) => p.id === data.productId);
-      return {
-        success: false,
-        error: `Insufficient stock in source location. Available: ${available} ${prod?.uom || ''}. Requested: ${data.quantity} ${prod?.uom || ''}.`,
-      };
-    }
-
-    const sourceWh = this.state.warehouses.find((w) => w.id === data.sourceWarehouseId);
-    const sourceLoc = this.state.locations.find((l) => l.id === data.sourceLocationId);
-    const destWh = this.state.warehouses.find((w) => w.id === data.destWarehouseId);
-    const destLoc = this.state.locations.find((l) => l.id === data.destLocationId);
-    const prod = this.state.products.find((p) => p.id === data.productId);
-
-    if (!sourceLoc || !destLoc || !prod) {
-      return { success: false, error: 'Invalid location or product details.' };
-    }
-
-    // Deduct from source
-    sourceQuant.quantity -= data.quantity;
-
-    // Add to destination
-    let destQuant = this.state.quants.find(
-      (q) => q.productId === data.productId && q.locationId === data.destLocationId
-    );
-    if (!destQuant) {
-      destQuant = {
-        id: `sq-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
-        productId: data.productId,
-        warehouseId: data.destWarehouseId,
-        locationId: data.destLocationId,
-        quantity: 0,
-        reservedQuantity: 0,
-      };
-      this.state.quants.push(destQuant);
-    }
-    destQuant.quantity += data.quantity;
-
-    // Total stock of product remains unchanged, but recalculate quant totals
-    this.updateProductStock(data.productId);
-
-    const refNum = 90 + this.state.transfers.length + 1;
-    const reference = `INT-00${refNum}`;
-
-    const newTransfer: InternalTransfer = {
-      id: `int-${Date.now()}`,
-      reference,
-      sourceWarehouseId: data.sourceWarehouseId,
-      sourceLocationId: data.sourceLocationId,
-      sourceLocationName: `${sourceWh?.name || 'Warehouse'} / ${sourceLoc.name}`,
-      destWarehouseId: data.destWarehouseId,
-      destLocationId: data.destLocationId,
-      destLocationName: `${destWh?.name || 'Warehouse'} / ${destLoc.name}`,
-      items: [
-        {
-          id: `ti-${Date.now()}`,
-          productId: prod.id,
-          productName: prod.name,
-          sku: prod.sku,
-          uom: prod.uom,
-          availableQty: available,
-          quantity: data.quantity,
-        },
-      ],
-      status: 'Done',
-      date: new Date().toLocaleDateString('en-US', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }),
-      notes: data.notes || 'Internal stock relocation',
-    };
-
-    this.state.transfers.unshift(newTransfer);
-
-    // Ledger Entry
-    const ledgerEntry: StockLedgerEntry = {
-      id: `mov-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
-      reference,
-      timestamp: new Date().toLocaleDateString('en-US', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }),
-      type: 'Internal Transfer',
-      productId: prod.id,
-      productName: prod.name,
-      sku: prod.sku,
-      fromLocation: `${sourceWh?.name} / ${sourceLoc.name}`,
-      toLocation: `${destWh?.name} / ${destLoc.name}`,
-      quantity: -data.quantity,
-      uom: prod.uom,
-      user: this.state.user.name,
-      status: 'Done',
-      notes: `Transferred ${data.quantity} ${prod.uom} from ${sourceLoc.name} to ${destLoc.name}`,
-    };
-
-    this.state.ledger.unshift(ledgerEntry);
-    this.persist();
-
-    return {
-      success: true,
-      transfer: newTransfer,
-      message: `Transfer ${reference} completed: ${sourceLoc.name} (${sourceQuant.quantity} ${prod.uom}) → ${destLoc.name} (${destQuant.quantity} ${prod.uom}). Total product stock unchanged.`,
-    };
-  }
-
-  // 4. INVENTORY ADJUSTMENT
-  public applyAdjustment(data: {
-    warehouseId: string;
-    locationId: string;
-    productId: string;
-    physicalCount: number;
-    reason: Adjustment['reason'];
-    notes?: string;
-  }): { success: boolean; adjustment?: Adjustment; message?: string; error?: string } {
-    if (data.physicalCount < 0) {
-      return { success: false, error: 'Physical count cannot be negative.' };
-    }
-
-    const warehouse = this.state.warehouses.find((w) => w.id === data.warehouseId);
-    const location = this.state.locations.find((l) => l.id === data.locationId);
-    const prod = this.state.products.find((p) => p.id === data.productId);
-
-    if (!location || !prod) {
-      return { success: false, error: 'Invalid location or product selected.' };
-    }
-
-    let quant = this.state.quants.find(
-      (q) => q.productId === data.productId && q.locationId === data.locationId
-    );
-
-    const systemQuantity = quant ? quant.quantity : 0;
-    const variance = data.physicalCount - systemQuantity;
-
-    if (!quant) {
-      quant = {
-        id: `sq-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
-        productId: data.productId,
-        warehouseId: data.warehouseId,
-        locationId: data.locationId,
-        quantity: 0,
-        reservedQuantity: 0,
-      };
-      this.state.quants.push(quant);
-    }
-
-    // Update quant to physical count
-    quant.quantity = data.physicalCount;
-    this.updateProductStock(data.productId);
-
-    const adjNumber = 12 + this.state.adjustments.length + 1;
-    const reference = `ADJ-00${adjNumber}`;
-
-    const newAdjustment: Adjustment = {
-      id: `adj-${Date.now()}`,
-      reference,
-      warehouseId: data.warehouseId,
-      locationId: data.locationId,
-      locationName: `${warehouse?.name || 'Warehouse'} / ${location.name}`,
-      productId: prod.id,
-      productName: prod.name,
-      sku: prod.sku,
-      uom: prod.uom,
-      systemQuantity,
-      physicalCount: data.physicalCount,
-      variance,
-      reason: data.reason,
-      status: 'Applied',
-      date: new Date().toLocaleDateString('en-US', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }),
-      notes: data.notes || `Stock audit adjustment (${data.reason})`,
-    };
-
-    this.state.adjustments.unshift(newAdjustment);
-
-    // Ledger Entry for adjustment
-    const ledgerEntry: StockLedgerEntry = {
-      id: `mov-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
-      reference,
-      timestamp: new Date().toLocaleDateString('en-US', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }),
-      type: 'Adjustment',
-      productId: prod.id,
-      productName: prod.name,
-      sku: prod.sku,
-      fromLocation: `${warehouse?.name} / ${location.name}`,
-      toLocation: variance < 0 ? 'Inventory Discrepancy / Scrap' : 'Inventory Surplus',
-      quantity: variance,
-      uom: prod.uom,
-      user: this.state.user.name,
-      status: 'Done',
-      notes: `Physical audit: ${systemQuantity} → ${data.physicalCount} (${variance > 0 ? '+' : ''}${variance} ${prod.uom}) Reason: ${data.reason}`,
-    };
-
-    this.state.ledger.unshift(ledgerEntry);
-    this.persist();
-
-    return {
-      success: true,
-      adjustment: newAdjustment,
-      message: `Adjustment ${reference} applied: ${prod.name} count updated to ${data.physicalCount} ${prod.uom} (Variance: ${variance > 0 ? '+' : ''}${variance} ${prod.uom}).`,
-    };
-  }
-
-  // 5. CREATE PRODUCT
+  // ==========================================
+  // TRANSACTIONAL MUTATIONS CONNECTED TO BACKEND
+  // ==========================================
+
+  // --- 1. CREATE PRODUCT ---
   public createProduct(data: {
     name: string;
     sku: string;
     categoryId: string;
     uom: string;
-    initialStock: number;
-    reorderLevel: number;
-    targetLevel: number;
-    warehouseId: string;
-    locationId: string;
+    initialStock?: number;
+    reorderLevel?: number;
+    targetLevel?: number;
+    warehouseId?: string;
+    locationId?: string;
     description?: string;
   }): { success: boolean; product?: Product; error?: string } {
     if (!data.name || !data.sku || !data.categoryId || !data.uom) {
@@ -865,15 +651,14 @@ class InventoryEngine {
       category.productCount += 1;
     }
 
-    // If initial stock > 0, create quant & ledger entry
-    if (data.initialStock > 0 && data.locationId) {
+    if (data.initialStock && data.initialStock > 0 && data.locationId) {
       const location = this.state.locations.find((l) => l.id === data.locationId);
       const warehouse = this.state.warehouses.find((w) => w.id === data.warehouseId);
 
       this.state.quants.push({
         id: `sq-${Date.now()}`,
         productId: newProduct.id,
-        warehouseId: data.warehouseId,
+        warehouseId: data.warehouseId || '1',
         locationId: data.locationId,
         quantity: data.initialStock,
         reservedQuantity: 0,
@@ -898,13 +683,580 @@ class InventoryEngine {
     }
 
     this.persist();
+
+    // Async sync to Spring Boot
+    const catId = parseInt(data.categoryId, 10) || 1;
+    backendApi.products.create({
+      name: data.name,
+      sku: skuUpper,
+      categoryId: catId,
+      unitOfMeasure: data.uom,
+      reorderLevel: data.reorderLevel || 50,
+    }).then(() => this.syncWithBackend()).catch((e) => console.warn('Backend product creation sync note:', e));
+
     return { success: true, product: newProduct };
   }
 
-  // 6. CYCLE COUNT ACTIONS
+  // --- 2. CREATE & VALIDATE RECEIPTS ---
+  public createReceipt(data: {
+    supplier: string;
+    warehouseId: string;
+    locationId: string;
+    items: { productId: string; orderedQty: number }[];
+    notes?: string;
+  }): { success: boolean; receipt?: Receipt; error?: string } {
+    if (!data.items || data.items.length === 0) {
+      return { success: false, error: 'At least one item is required.' };
+    }
+
+    const warehouse = this.state.warehouses.find((w) => w.id === data.warehouseId);
+    const location = this.state.locations.find((l) => l.id === data.locationId);
+
+    const receiptItems: ReceiptItem[] = data.items.map((it) => {
+      const prod = this.getProductById(it.productId);
+      return {
+        id: `line-${Date.now()}-${Math.random()}`,
+        productId: it.productId,
+        productName: prod?.name || 'Product',
+        sku: prod?.sku || 'SKU',
+        uom: prod?.uom || 'pcs',
+        orderedQty: it.orderedQty,
+        receivedQty: 0,
+      };
+    });
+
+    const receipt: Receipt = {
+      id: `rec-${Date.now()}`,
+      reference: `WH/IN/${String(this.state.receipts.length + 1).padStart(4, '0')}`,
+      supplier: data.supplier || 'Vendor',
+      warehouseId: data.warehouseId,
+      locationId: data.locationId,
+      warehouseName: warehouse?.name || 'Main Warehouse',
+      locationName: location?.name || 'Rack A',
+      status: 'Draft',
+      date: new Date().toLocaleDateString(),
+      notes: data.notes,
+      items: receiptItems,
+    };
+
+    this.state.receipts.unshift(receipt);
+    this.persist();
+
+    // Async sync to backend
+    const locIdNum = parseInt(data.locationId, 10) || 1;
+    const backendItems = data.items.map((it) => ({
+      productId: parseInt(it.productId, 10) || 1,
+      quantity: it.orderedQty,
+    }));
+    backendApi.receipts.create({
+      supplier: data.supplier,
+      destinationLocationId: locIdNum,
+      notes: data.notes,
+      items: backendItems,
+    }).then(() => this.syncWithBackend()).catch((e) => console.warn('Backend receipt creation sync note:', e));
+
+    return { success: true, receipt };
+  }
+
+  public validateReceipt(receiptId: string): { success: boolean; message: string; error?: string } {
+    const receipt = this.state.receipts.find((r) => r.id === receiptId);
+    if (!receipt) return { success: false, message: '', error: 'Receipt not found' };
+    if (receipt.status === 'Done') return { success: false, message: '', error: 'Receipt already validated' };
+
+    receipt.status = 'Done';
+    receipt.items.forEach((item) => {
+      item.receivedQty = item.orderedQty;
+
+      const quant = this.state.quants.find(
+        (q) => q.productId === item.productId && q.locationId === receipt.locationId
+      );
+      if (quant) {
+        quant.quantity += item.orderedQty;
+      } else {
+        this.state.quants.push({
+          id: `quant-${Date.now()}`,
+          productId: item.productId,
+          warehouseId: receipt.warehouseId,
+          locationId: receipt.locationId,
+          quantity: item.orderedQty,
+          reservedQuantity: 0,
+        });
+      }
+
+      this.state.ledger.unshift({
+        id: `led-${Date.now()}`,
+        reference: receipt.reference,
+        timestamp: new Date().toLocaleDateString('en-US', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }),
+        type: 'Receipt',
+        productId: item.productId,
+        productName: item.productName,
+        sku: item.sku,
+        fromLocation: receipt.supplier || 'Vendor Location',
+        toLocation: `${receipt.warehouseName} / ${receipt.locationName}`,
+        quantity: item.orderedQty,
+        uom: item.uom,
+        user: this.state.user.name,
+        status: 'Done',
+        notes: receipt.notes,
+      });
+    });
+
+    this.recalculateAllProductStocks();
+    this.persist();
+
+    // Async sync to backend
+    if (receiptId.length > 20) {
+      backendApi.receipts.validate(receiptId).then(() => this.syncWithBackend()).catch((e) => console.warn('Backend receipt validation error:', e));
+    }
+
+    return { success: true, message: `Receipt ${receipt.reference} successfully received into inventory.` };
+  }
+
+  // --- 3. CREATE & VALIDATE DELIVERIES ---
+  public createDelivery(data: {
+    customer: string;
+    warehouseId: string;
+    locationId: string;
+    items: { productId: string; requestedQty: number }[];
+    notes?: string;
+  }): { success: boolean; delivery?: Delivery; error?: string } {
+    if (!data.items || data.items.length === 0) {
+      return { success: false, error: 'At least one item is required.' };
+    }
+
+    const warehouse = this.state.warehouses.find((w) => w.id === data.warehouseId);
+    const location = this.state.locations.find((l) => l.id === data.locationId);
+
+    const deliveryItems: DeliveryItem[] = data.items.map((it) => {
+      const prod = this.getProductById(it.productId);
+      const quant = this.state.quants.find((q) => q.productId === it.productId && q.locationId === data.locationId);
+      return {
+        id: `line-${Date.now()}-${Math.random()}`,
+        productId: it.productId,
+        productName: prod?.name || 'Product',
+        sku: prod?.sku || 'SKU',
+        uom: prod?.uom || 'pcs',
+        availableQty: quant ? quant.quantity : 0,
+        requestedQty: it.requestedQty,
+        deliveredQty: 0,
+      };
+    });
+
+    const delivery: Delivery = {
+      id: `del-${Date.now()}`,
+      reference: `WH/OUT/${String(this.state.deliveries.length + 1).padStart(4, '0')}`,
+      customer: data.customer || 'Customer',
+      warehouseId: data.warehouseId,
+      locationId: data.locationId,
+      warehouseName: warehouse?.name || 'Main Warehouse',
+      locationName: location?.name || 'Rack B',
+      status: 'Draft',
+      date: new Date().toLocaleDateString(),
+      notes: data.notes,
+      items: deliveryItems,
+    };
+
+    this.state.deliveries.unshift(delivery);
+    this.persist();
+
+    // Async sync to backend
+    const locIdNum = parseInt(data.locationId, 10) || 1;
+    const backendItems = data.items.map((it) => ({
+      productId: parseInt(it.productId, 10) || 1,
+      quantity: it.requestedQty,
+    }));
+    backendApi.deliveries.create({
+      customer: data.customer,
+      sourceLocationId: locIdNum,
+      notes: data.notes,
+      items: backendItems,
+    }).then(() => this.syncWithBackend()).catch((e) => console.warn('Backend delivery creation sync note:', e));
+
+    return { success: true, delivery };
+  }
+
+  public validateDelivery(deliveryId: string): { success: boolean; message: string; error?: string } {
+    const delivery = this.state.deliveries.find((d) => d.id === deliveryId);
+    if (!delivery) return { success: false, message: '', error: 'Delivery order not found' };
+    if (delivery.status === 'Done') return { success: false, message: '', error: 'Delivery order is already validated' };
+
+    // Stock sufficiency check
+    for (const item of delivery.items) {
+      const quant = this.state.quants.find((q) => q.productId === item.productId && q.locationId === delivery.locationId);
+      const available = quant ? quant.quantity : 0;
+      if (item.requestedQty > available) {
+        return {
+          success: false,
+          message: '',
+          error: `Insufficient stock for ${item.productName}. Available in ${delivery.locationName}: ${available} ${item.uom}, Requested: ${item.requestedQty} ${item.uom}.`,
+        };
+      }
+    }
+
+    delivery.status = 'Done';
+    delivery.items.forEach((item) => {
+      item.deliveredQty = item.requestedQty;
+      const quant = this.state.quants.find((q) => q.productId === item.productId && q.locationId === delivery.locationId);
+      if (quant) {
+        quant.quantity = Math.max(0, quant.quantity - item.requestedQty);
+      }
+
+      this.state.ledger.unshift({
+        id: `led-${Date.now()}`,
+        reference: delivery.reference,
+        timestamp: new Date().toLocaleDateString('en-US', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }),
+        type: 'Delivery',
+        productId: item.productId,
+        productName: item.productName,
+        sku: item.sku,
+        fromLocation: `${delivery.warehouseName} / ${delivery.locationName}`,
+        toLocation: delivery.customer || 'Customer Delivery',
+        quantity: -item.requestedQty,
+        uom: item.uom,
+        user: this.state.user.name,
+        status: 'Done',
+        notes: delivery.notes,
+      });
+    });
+
+    this.recalculateAllProductStocks();
+    this.persist();
+
+    // Async sync to backend
+    if (deliveryId.length > 20) {
+      backendApi.deliveries.validate(deliveryId).then(() => this.syncWithBackend()).catch((e) => console.warn('Backend delivery validate note:', e));
+    }
+
+    return { success: true, message: `Delivery ${delivery.reference} dispatched successfully.` };
+  }
+
+  // --- 4. INTERNAL TRANSFERS ---
+  public createAndExecuteTransfer(data: {
+    sourceWarehouseId: string;
+    sourceLocationId: string;
+    destWarehouseId: string;
+    destLocationId: string;
+    productId: string;
+    quantity: number;
+    notes?: string;
+  }): { success: boolean; transfer?: InternalTransfer; message: string; error?: string } {
+    if (data.sourceLocationId === data.destLocationId) {
+      return { success: false, message: '', error: 'Source and destination locations cannot be identical.' };
+    }
+
+    const product = this.getProductById(data.productId);
+    if (!product) return { success: false, message: '', error: 'Product not found' };
+
+    const srcQuant = this.state.quants.find(
+      (q) => q.productId === data.productId && q.locationId === data.sourceLocationId
+    );
+    const available = srcQuant ? srcQuant.quantity : 0;
+    if (data.quantity > available) {
+      return {
+        success: false,
+        message: '',
+        error: `Insufficient stock in source location. Available: ${available} ${product.uom}, Requested: ${data.quantity} ${product.uom}.`,
+      };
+    }
+
+    const srcLoc = this.state.locations.find((l) => l.id === data.sourceLocationId);
+    const destLoc = this.state.locations.find((l) => l.id === data.destLocationId);
+
+    // Atomically transfer quantities
+    if (srcQuant) {
+      srcQuant.quantity -= data.quantity;
+    }
+
+    const destQuant = this.state.quants.find(
+      (q) => q.productId === data.productId && q.locationId === data.destLocationId
+    );
+    if (destQuant) {
+      destQuant.quantity += data.quantity;
+    } else {
+      this.state.quants.push({
+        id: `quant-${Date.now()}`,
+        productId: data.productId,
+        warehouseId: data.destWarehouseId,
+        locationId: data.destLocationId,
+        quantity: data.quantity,
+        reservedQuantity: 0,
+      });
+    }
+
+    const transfer: InternalTransfer = {
+      id: `tra-${Date.now()}`,
+      reference: `WH/INT/${String(this.state.transfers.length + 1).padStart(4, '0')}`,
+      sourceWarehouseId: data.sourceWarehouseId,
+      sourceLocationId: data.sourceLocationId,
+      sourceLocationName: srcLoc?.name || 'Rack A',
+      destWarehouseId: data.destWarehouseId,
+      destLocationId: data.destLocationId,
+      destLocationName: destLoc?.name || 'Rack P1',
+      status: 'Done',
+      date: new Date().toLocaleDateString(),
+      notes: data.notes,
+      items: [
+        {
+          id: `line-${Date.now()}`,
+          productId: data.productId,
+          productName: product.name,
+          sku: product.sku,
+          uom: product.uom,
+          availableQty: available,
+          quantity: data.quantity,
+        },
+      ],
+    };
+
+    this.state.transfers.unshift(transfer);
+
+    this.state.ledger.unshift({
+      id: `led-${Date.now()}`,
+      reference: transfer.reference,
+      timestamp: new Date().toLocaleDateString('en-US', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }),
+      type: 'Internal Transfer',
+      productId: data.productId,
+      productName: product.name,
+      sku: product.sku,
+      fromLocation: srcLoc?.name || 'Rack A',
+      toLocation: destLoc?.name || 'Rack P1',
+      quantity: data.quantity,
+      uom: product.uom,
+      user: this.state.user.name,
+      status: 'Done',
+      notes: data.notes || 'Internal stock relocation',
+    });
+
+    this.recalculateAllProductStocks();
+    this.persist();
+
+    // Async sync to Spring Boot
+    const srcIdNum = parseInt(data.sourceLocationId, 10) || 1;
+    const destIdNum = parseInt(data.destLocationId, 10) || 4;
+    const prodIdNum = parseInt(data.productId, 10) || 1;
+    backendApi.transfers.create({
+      sourceLocationId: srcIdNum,
+      destinationLocationId: destIdNum,
+      notes: data.notes,
+      items: [{ productId: prodIdNum, quantity: data.quantity }],
+    }).then((doc) => backendApi.transfers.validate(doc.documentId)).then(() => this.syncWithBackend()).catch((e) => console.warn('Backend transfer note:', e));
+
+    return { success: true, transfer, message: `Transferred ${data.quantity} ${product.uom} to ${destLoc?.name || 'Rack P1'}.` };
+  }
+
+  public createTransfer(data: {
+    sourceWarehouseId: string;
+    sourceLocationId: string;
+    destWarehouseId: string;
+    destLocationId: string;
+    items: { productId: string; quantity: number }[];
+    notes?: string;
+  }): { success: boolean; transfer?: InternalTransfer; error?: string } {
+    if (!data.items || data.items.length === 0) {
+      return { success: false, error: 'At least one item is required.' };
+    }
+
+    const srcLoc = this.state.locations.find((l) => l.id === data.sourceLocationId);
+    const destLoc = this.state.locations.find((l) => l.id === data.destLocationId);
+
+    const transferItems: TransferItem[] = data.items.map((it) => {
+      const prod = this.getProductById(it.productId);
+      const quant = this.state.quants.find((q) => q.productId === it.productId && q.locationId === data.sourceLocationId);
+      return {
+        id: `line-${Date.now()}-${Math.random()}`,
+        productId: it.productId,
+        productName: prod?.name || 'Product',
+        sku: prod?.sku || 'SKU',
+        uom: prod?.uom || 'pcs',
+        availableQty: quant ? quant.quantity : 0,
+        quantity: it.quantity,
+      };
+    });
+
+    const transfer: InternalTransfer = {
+      id: `tra-${Date.now()}`,
+      reference: `WH/INT/${String(this.state.transfers.length + 1).padStart(4, '0')}`,
+      sourceWarehouseId: data.sourceWarehouseId,
+      sourceLocationId: data.sourceLocationId,
+      sourceLocationName: srcLoc?.name || 'Rack A',
+      destWarehouseId: data.destWarehouseId,
+      destLocationId: data.destLocationId,
+      destLocationName: destLoc?.name || 'Rack P1',
+      status: 'Draft',
+      date: new Date().toLocaleDateString(),
+      notes: data.notes,
+      items: transferItems,
+    };
+
+    this.state.transfers.unshift(transfer);
+    this.persist();
+
+    return { success: true, transfer };
+  }
+
+  public validateTransfer(transferId: string): { success: boolean; message: string; error?: string } {
+    const transfer = this.state.transfers.find((t) => t.id === transferId);
+    if (!transfer) return { success: false, message: '', error: 'Transfer not found' };
+    if (transfer.status === 'Done') return { success: false, message: '', error: 'Transfer already completed' };
+
+    for (const item of transfer.items) {
+      const srcQuant = this.state.quants.find(
+        (q) => q.productId === item.productId && q.locationId === transfer.sourceLocationId
+      );
+      const available = srcQuant ? srcQuant.quantity : 0;
+      if (item.quantity > available) {
+        return {
+          success: false,
+          message: '',
+          error: `Insufficient stock for ${item.productName}. Available: ${available}, Requested: ${item.quantity}.`,
+        };
+      }
+    }
+
+    transfer.status = 'Done';
+    transfer.items.forEach((item) => {
+      const srcQuant = this.state.quants.find(
+        (q) => q.productId === item.productId && q.locationId === transfer.sourceLocationId
+      );
+      if (srcQuant) {
+        srcQuant.quantity -= item.quantity;
+      }
+
+      const destQuant = this.state.quants.find(
+        (q) => q.productId === item.productId && q.locationId === transfer.destLocationId
+      );
+      if (destQuant) {
+        destQuant.quantity += item.quantity;
+      } else {
+        this.state.quants.push({
+          id: `quant-${Date.now()}`,
+          productId: item.productId,
+          warehouseId: transfer.destWarehouseId,
+          locationId: transfer.destLocationId,
+          quantity: item.quantity,
+          reservedQuantity: 0,
+        });
+      }
+
+      this.state.ledger.unshift({
+        id: `led-${Date.now()}`,
+        reference: transfer.reference,
+        timestamp: new Date().toLocaleDateString('en-US', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }),
+        type: 'Internal Transfer',
+        productId: item.productId,
+        productName: item.productName,
+        sku: item.sku,
+        fromLocation: transfer.sourceLocationName,
+        toLocation: transfer.destLocationName,
+        quantity: item.quantity,
+        uom: item.uom,
+        user: this.state.user.name,
+        status: 'Done',
+        notes: transfer.notes,
+      });
+    });
+
+    this.recalculateAllProductStocks();
+    this.persist();
+
+    return { success: true, message: `Transfer ${transfer.reference} completed.` };
+  }
+
+  // --- 5. STOCK ADJUSTMENTS ---
+  public applyAdjustment(data: {
+    warehouseId: string;
+    locationId: string;
+    productId: string;
+    physicalCount: number;
+    reason: AdjustmentReason;
+    notes?: string;
+  }): { success: boolean; adjustment?: Adjustment; message: string; error?: string } {
+    const product = this.getProductById(data.productId);
+    if (!product) return { success: false, message: '', error: 'Product not found' };
+
+    const quant = this.state.quants.find(
+      (q) => q.productId === data.productId && q.locationId === data.locationId
+    );
+    const systemQuantity = quant ? quant.quantity : 0;
+    const variance = data.physicalCount - systemQuantity;
+
+    if (quant) {
+      quant.quantity = data.physicalCount;
+    } else {
+      this.state.quants.push({
+        id: `sq-${Date.now()}`,
+        productId: data.productId,
+        warehouseId: data.warehouseId,
+        locationId: data.locationId,
+        quantity: data.physicalCount,
+        reservedQuantity: 0,
+      });
+    }
+
+    const loc = this.state.locations.find((l) => l.id === data.locationId);
+    const wh = this.state.warehouses.find((w) => w.id === data.warehouseId);
+
+    const adj: Adjustment = {
+      id: `adj-${Date.now()}`,
+      reference: `WH/ADJ/${String(this.state.adjustments.length + 1).padStart(4, '0')}`,
+      productId: data.productId,
+      productName: product.name,
+      sku: product.sku,
+      uom: product.uom,
+      warehouseId: data.warehouseId,
+      locationId: data.locationId,
+      locationName: loc?.name || 'Rack A',
+      systemQuantity,
+      physicalCount: data.physicalCount,
+      variance,
+      reason: data.reason,
+      status: 'Applied',
+      date: new Date().toLocaleDateString(),
+      notes: data.notes,
+    };
+
+    this.state.adjustments.unshift(adj);
+
+    this.state.ledger.unshift({
+      id: `led-${Date.now()}`,
+      reference: adj.reference,
+      timestamp: new Date().toLocaleDateString('en-US', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }),
+      type: 'Adjustment',
+      productId: data.productId,
+      productName: product.name,
+      sku: product.sku,
+      fromLocation: `${wh?.name || 'Warehouse'} / ${loc?.name || 'Rack'}`,
+      toLocation: 'Inventory Reconciliation',
+      quantity: variance,
+      uom: product.uom,
+      user: this.state.user.name,
+      status: 'Done',
+      notes: `${data.reason}: ${data.notes || 'Physical Count Reconciliation'}`,
+    });
+
+    this.recalculateAllProductStocks();
+    this.persist();
+
+    // Async sync to Spring Boot
+    const locIdNum = parseInt(data.locationId, 10) || 1;
+    const prodIdNum = parseInt(data.productId, 10) || 1;
+    backendApi.adjustments.create({
+      locationId: locIdNum,
+      reason: data.reason,
+      items: [{ productId: prodIdNum, countedQuantity: data.physicalCount }],
+    }).then((doc) => backendApi.adjustments.validate(doc.documentId)).then(() => this.syncWithBackend()).catch((e) => console.warn('Backend adjustment note:', e));
+
+    return {
+      success: true,
+      adjustment: adj,
+      message: `Adjustment applied. System stock updated to ${data.physicalCount} ${product.uom} (Variance: ${variance >= 0 ? '+' : ''}${variance}).`,
+    };
+  }
+
+  // --- 6. CYCLE COUNTS ---
   public updateCycleCount(id: string, countedQuantity: number): { success: boolean; error?: string } {
     const item = this.state.cycleCounts.find((c) => c.id === id);
-    if (!item) return { success: false, error: 'Cycle count not found' };
+    if (!item) return { success: false, error: 'Cycle count item not found' };
 
     item.countedQuantity = countedQuantity;
     item.variance = countedQuantity - item.systemQuantity;
@@ -915,22 +1267,18 @@ class InventoryEngine {
 
   public completeCycleCount(id: string): { success: boolean; error?: string } {
     const item = this.state.cycleCounts.find((c) => c.id === id);
-    if (!item) return { success: false, error: 'Cycle count not found' };
+    if (!item) return { success: false, error: 'Cycle count item not found' };
 
     if (item.countedQuantity !== undefined && item.variance !== undefined && item.variance !== 0) {
-      // automatically execute adjustment if variance exists
-      const quant = this.state.quants.find((q) => q.locationId === item.locationId && q.productId === item.productId);
       const location = this.state.locations.find((l) => l.id === item.locationId);
-      if (quant && location) {
-        this.applyAdjustment({
-          warehouseId: location.warehouseId,
-          locationId: item.locationId,
-          productId: item.productId,
-          physicalCount: item.countedQuantity,
-          reason: 'Counting Error',
-          notes: `Applied from Cycle Count ${item.id}`,
-        });
-      }
+      this.applyAdjustment({
+        warehouseId: location?.warehouseId || '1',
+        locationId: item.locationId,
+        productId: item.productId,
+        physicalCount: item.countedQuantity,
+        reason: 'Counting Error',
+        notes: `Reconciled from Cycle Count ${item.id}`,
+      });
     }
 
     item.status = 'Completed';
@@ -938,22 +1286,20 @@ class InventoryEngine {
     return { success: true };
   }
 
-  // 7. GOLDEN DEMO SCENARIO RUNNER
+  // --- 7. GOLDEN DEMO SCENARIO RUNNER ---
   public runGoldenDemoStep(step: 1 | 2 | 3 | 4 | 5): { success: boolean; message: string; stateSnapshot?: any } {
-    const steelRod = this.state.products.find((p) => p.sku === 'STL-001');
+    const steelRod = this.state.products.find((p) => p.sku === 'STL-001') || this.state.products[0];
     if (!steelRod) return { success: false, message: 'Steel Rod (STL-001) not found' };
 
     if (step === 1) {
       // Step 1: Start Steel Rod at 0 kg, then receive +100 kg at Main Warehouse / Rack A
-      // Set existing quants for steel rod to 0 first to clearly demonstrate from zero
       this.state.quants.filter((q) => q.productId === steelRod.id).forEach((q) => (q.quantity = 0));
-      this.updateProductStock(steelRod.id);
+      this.recalculateAllProductStocks();
 
-      // Create & Validate Receipt for 100 kg
       const receiptRes = this.createReceipt({
         supplier: 'ABC Metals',
-        warehouseId: 'wh-main',
-        locationId: 'loc-rack-a',
+        warehouseId: '1',
+        locationId: '1',
         items: [{ productId: steelRod.id, orderedQty: 100 }],
         notes: 'Golden Demo Step 1: Inbound Replenishment Batch',
       });
@@ -971,17 +1317,17 @@ class InventoryEngine {
     if (step === 2) {
       // Step 2: Transfer 30 kg from Main Warehouse / Rack A to Production / Rack P1
       const res = this.createAndExecuteTransfer({
-        sourceWarehouseId: 'wh-main',
-        sourceLocationId: 'loc-rack-a',
-        destWarehouseId: 'wh-prod',
-        destLocationId: 'loc-prod-p1',
+        sourceWarehouseId: '1',
+        sourceLocationId: '1',
+        destWarehouseId: '1',
+        destLocationId: '4',
         productId: steelRod.id,
         quantity: 30,
         notes: 'Golden Demo Step 2: Internal Transfer to Production Rack P1',
       });
 
-      const rackAQuant = this.state.quants.find((q) => q.productId === steelRod.id && q.locationId === 'loc-rack-a')?.quantity || 0;
-      const prodP1Quant = this.state.quants.find((q) => q.productId === steelRod.id && q.locationId === 'loc-prod-p1')?.quantity || 0;
+      const rackAQuant = this.state.quants.find((q) => q.productId === steelRod.id && q.locationId === '1')?.quantity || 0;
+      const prodP1Quant = this.state.quants.find((q) => q.productId === steelRod.id && q.locationId === '4')?.quantity || 0;
 
       return {
         success: res.success,
@@ -993,8 +1339,8 @@ class InventoryEngine {
       // Step 3: Delivery 20 kg to customer -> Total becomes 80 kg
       const deliveryRes = this.createDelivery({
         customer: 'Apex Manufacturing',
-        warehouseId: 'wh-main',
-        locationId: 'loc-rack-a',
+        warehouseId: '1',
+        locationId: '1',
         items: [{ productId: steelRod.id, requestedQty: 20 }],
         notes: 'Golden Demo Step 3: Outgoing customer delivery',
       });
@@ -1012,8 +1358,8 @@ class InventoryEngine {
     if (step === 4) {
       // Step 4: Physical count: 77 kg -> Adjustment: -3 kg -> Final = 77 kg
       const res = this.applyAdjustment({
-        warehouseId: 'wh-main',
-        locationId: 'loc-rack-a',
+        warehouseId: '1',
+        locationId: '1',
         productId: steelRod.id,
         physicalCount: 47, // 50 - 3 in Rack A + 30 in Production = 77 kg total!
         reason: 'Damaged',
@@ -1027,7 +1373,6 @@ class InventoryEngine {
     }
 
     if (step === 5) {
-      // Inspection: Returns audit summary
       return {
         success: true,
         message: `Step 5: All 4 transactions (+100 Receipt, -30 Transfer, -20 Delivery, -3 Adjustment) are logged in the immutable Stock Ledger. Steel Rod final balance: ${steelRod.totalStock} kg.`,
@@ -1035,6 +1380,18 @@ class InventoryEngine {
     }
 
     return { success: false, message: 'Invalid demo step' };
+  }
+
+  private recalculateAllProductStocks() {
+    this.state.products.forEach((p) => {
+      const pQuants = this.state.quants.filter((q) => q.productId === p.id);
+      const total = pQuants.reduce((sum, q) => sum + q.quantity, 0);
+      const reserved = pQuants.reduce((sum, q) => sum + q.reservedQuantity, 0);
+      p.totalStock = total;
+      p.availableStock = Math.max(0, total - reserved);
+      p.reservedStock = reserved;
+      p.status = this.recalculateProductStatus(p);
+    });
   }
 }
 

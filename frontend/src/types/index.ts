@@ -126,9 +126,11 @@ export interface InternalTransfer {
   id: string;
   reference: string; // e.g. INT-0091
   sourceWarehouseId: string;
+  sourceWarehouseName?: string;
   sourceLocationId: string;
   sourceLocationName: string;
   destWarehouseId: string;
+  destWarehouseName?: string;
   destLocationId: string;
   destLocationName: string;
   items: TransferItem[];
@@ -176,6 +178,8 @@ export interface StockLedgerEntry {
   user: string;
   status: 'Done';
   notes?: string;
+  impact?: 'IN' | 'OUT' | 'INTERNAL';
+  balanceAfter?: number;
 }
 
 export type CycleCountStatus = 'Pending' | 'Counting' | 'Review' | 'Completed';

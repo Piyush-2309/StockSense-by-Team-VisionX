@@ -28,10 +28,12 @@ import { CategoriesView } from './views/CategoriesView';
 import { ReorderingRulesView } from './views/ReorderingRulesView';
 import { ProfileView } from './views/ProfileView';
 import { AuthView } from './views/AuthView';
-import { Sparkles, Bot } from 'lucide-react';
+import { AuthProvider, useAuth } from './context/AuthContext';
+import { Sparkles, Bot, Layers } from 'lucide-react';
 
 const MainApplication: React.FC = () => {
   const { showToast } = useToast();
+  const { user: authUser, isAuthenticated, isLoading: isAuthLoading, logout } = useAuth();
   const [, setTick] = useState(0);
 
   // Router & Entity State
@@ -77,7 +79,45 @@ const MainApplication: React.FC = () => {
   const notifications = inventoryEngine.getNotifications();
   const unreadNotifications = notifications.filter((n) => !n.isRead).length;
 
-  if (currentRoute === 'login') {
+  if (isAuthLoading) {
+    return (
+      <div
+        style={{
+          minHeight: '100vh',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          background: '#0B0F19',
+          color: '#FFFFFF',
+          fontFamily: 'Inter, system-ui, sans-serif',
+        }}
+      >
+        <div style={{ textAlign: 'center' }}>
+          <div
+            style={{
+              width: 64,
+              height: 64,
+              borderRadius: 18,
+              background: 'linear-gradient(135deg, #7C3AED 0%, #4C1D95 100%)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              margin: '0 auto 20px',
+              boxShadow: '0 8px 30px rgba(124, 58, 237, 0.5)',
+            }}
+          >
+            <Layers size={32} color="#FFFFFF" />
+          </div>
+          <h2 style={{ fontSize: 22, fontWeight: 700, letterSpacing: '-0.02em' }}>StockSense</h2>
+          <p style={{ color: '#94A3B8', fontSize: 13.5, marginTop: 6 }}>
+            Connecting to inventory engine & validating session...
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!isAuthenticated || currentRoute === 'login') {
     return <AuthView onLoginSuccess={() => setCurrentRoute('dashboard')} />;
   }
 
@@ -100,7 +140,22 @@ const MainApplication: React.FC = () => {
           warehouses={warehouses}
           selectedWarehouse={selectedWarehouse}
           onSelectWarehouse={setSelectedWarehouse}
-          user={user}
+          user={
+            authUser
+              ? {
+                  id: authUser.id,
+                  name: authUser.name,
+                  email: authUser.email,
+                  role: authUser.role,
+                  avatar: authUser.name
+                    .split(' ')
+                    .map((s) => s[0])
+                    .join('')
+                    .substring(0, 2)
+                    .toUpperCase(),
+                }
+              : user
+          }
           unreadNotificationsCount={unreadNotifications}
           onOpenNotifications={() => setIsNotificationsOpen(true)}
           onOpenSearch={() => setIsSearchOpen(true)}
@@ -108,6 +163,10 @@ const MainApplication: React.FC = () => {
           onOpenGoldenDemo={() => setIsGoldenDemoOpen(true)}
           onResetData={handleResetData}
           onNavigate={handleNavigate}
+          onLogout={async () => {
+            await logout();
+            setCurrentRoute('login');
+          }}
         />
 
         {/* Dynamic Route View */}
@@ -333,7 +392,9 @@ const MainApplication: React.FC = () => {
 export function App() {
   return (
     <ToastProvider>
-      <MainApplication />
+      <AuthProvider>
+        <MainApplication />
+      </AuthProvider>
     </ToastProvider>
   );
 }
